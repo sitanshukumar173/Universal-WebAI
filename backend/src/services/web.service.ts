@@ -40,6 +40,7 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
 //vector serch for question asked to find top- 1 relevent link
 export const vectorSearch = async (
   questionVector: number[],
+  domain: string,
 ): Promise<VectorSearchHit[]> => {
   return await SitemapModel.aggregate<VectorSearchHit>([
     {
@@ -48,9 +49,10 @@ export const vectorSearch = async (
         path: "embedding",
         queryVector: questionVector,
         numCandidates: 50,
-        limit: 1, //give- 1 most relevnt url
+        limit: 1,
       },
     },
-    { $project: { url: 1, score: { $meta: "vectorSearchScore" } } },
+    { $project: { url: 1, domain: 1, score: { $meta: "vectorSearchScore" } } },
+    { $match: { domain } },
   ]);
 };

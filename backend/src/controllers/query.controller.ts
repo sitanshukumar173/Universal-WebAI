@@ -1,7 +1,11 @@
 import type { Request, Response } from "express";
 import { WebsiteModel } from "../models.js";
 import { getFirecrawl, scrapeUrlCompat } from "../scraper.js";
-import { getEmbedding, synthesizeAnswer } from "../services/ai.service.js";
+import {
+  getEmbedding,
+  synthesizeAnswer,
+  synthesizeRelevantLinks,
+} from "../services/ai.service.js";
 import type { ExtractCompatResult, VectorSearchHit } from "../types.js";
 import { mapNewWebsite, vectorSearch } from "../services/web.service.js";
 
@@ -20,9 +24,9 @@ export const handleQuery = async (req: Request, res: Response) => {
 
     //makes embedding of question and serch in db
     const questionVector = await getEmbedding(question);
-    const relevantLinks = await vectorSearch(questionVector);
+    const candidateLinks = await vectorSearch(questionVector, domain);
     //if relevrnt link have low score(<0.7/70%) then Fallback
-    let targetUrls: string[] = relevantLinks
+    let targetUrls: string[] = candidateLinks
       .filter((l: VectorSearchHit) => l.score > 0.7)
       .map((l: VectorSearchHit) => l.url);
 
@@ -37,8 +41,10 @@ export const handleQuery = async (req: Request, res: Response) => {
         .filter((url): url is string => Boolean(url)) ?? [websiteUrl];
     }
 
+    const sources = Array.from(new Set(targetUrls));
+
     //actual text extraction from urls
-    const extractionPromises = targetUrls.map(async (url: string) => {
+    const extractionPromises = sources.map(async (url: string) => {
       //if text extraction takes more tehn 30s then timeout
       const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error("Timeout")), 30000),
@@ -74,8 +80,13 @@ export const handleQuery = async (req: Request, res: Response) => {
     // Synthesis the extracted text(context)+question with ai to give proper ansewr
     const context = results.map((r) => r.extract?.answer).join("\n---\n");
     const answer = await synthesizeAnswer(question, context);
+    const relevantLinks = await synthesizeRelevantLinks(
+      question,
+      context,
+      sources,
+    );
 
-    return res.status(200).json({ answer, sources: targetUrls });
+    return res.status(200).json({ answer, sources, relevantLinks });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
