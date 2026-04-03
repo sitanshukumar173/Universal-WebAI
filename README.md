@@ -163,7 +163,7 @@ GEMINI_ANSWER_MODEL=gemini-2.5-flash</code></pre>
   <li><b>Run the frontend:</b> <code>cd frontend && npm run dev</code></li>
   <li><b>Hardcode your target URL:</b> Open <code>frontend/src/App.jsx</code> and change line 7 to whatever site you want to test against. The AI will pretend it's running as an extension on this tab.
 <pre><code>// Change this to any domain you want to test (e.g., your university or a tech blog)
-const devFallbackUrl = "https://www.cashify.in/";</code></pre>
+const devFallbackUrl = "https://www.example.com/";</code></pre>
   </li>
   <li><b>Access the UI:</b> Open <code>http://localhost:5173</code>.</li>
 </ol>
@@ -234,6 +234,4 @@ const devFallbackUrl = "https://www.cashify.in/";</code></pre>
 
 <br/>
 
-<div align="center">
-  <p><b>Built with 🖤 by an engineer tired of reading PDFs.</b></p>
-</div>
+
