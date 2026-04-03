@@ -2,7 +2,6 @@
 
 <img width="200" height="400" alt="Universal WebAI" src="https://github.com/user-attachments/assets/ec132449-0cf4-4564-9212-2cf55ff62a7b" />
 
-
   <h1 style="font-size: 3em; margin-bottom: 0;">🌐 Universal WebAI</h1>
   
   <p>
@@ -33,9 +32,11 @@
 <br/>
 
 <div align="center">
- <video src="https://res.cloudinary.com/dlpluej6w/video/upload/v1775209528/universal-web-ai-demov_3SY6TxXh_qxvg7c.mp4" width="100%" style="border-radius: 12px; box-shadow: 0 8px 16px rgba(0,0,0,0.5);" autoplay loop muted playsinline>
-   
-  </video>
+
+
+https://github.com/user-attachments/assets/c2430b54-d7ec-4530-8e85-1f37537de374
+
+
   <p><em>  Universal WebAI Demo Video </em></p>
 </div>
 
