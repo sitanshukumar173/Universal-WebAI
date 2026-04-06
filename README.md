@@ -239,3 +239,6 @@ const devFallbackUrl = "https://www.example.com/";</code></pre>
 <br/>
 
 
+License
+Copyright (c) 2026 Sitanshu Kumar Chourasia. All rights reserved.
+
