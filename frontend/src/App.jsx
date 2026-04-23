@@ -35,13 +35,25 @@ export default function App() {
     setLoading(true);
 
     try {
+      // Send both the current page URL and the base domain URL.
+      // Backend uses current page as first priority and base as second priority.
+      const normalizedActiveUrl = activeUrl || devFallbackUrl;
+      let baseUrl = normalizedActiveUrl;
+      try {
+        baseUrl = `${new URL(normalizedActiveUrl).origin}/`;
+      } catch {
+        baseUrl = normalizedActiveUrl;
+      }
+
       // Send question to backend
       const res = await fetch("http://localhost:5000/api/v1/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: query,
-          websiteUrl: activeUrl
+          websiteUrl: normalizedActiveUrl,
+          currentPageUrl: normalizedActiveUrl,
+          baseUrl
         })
       });
 
