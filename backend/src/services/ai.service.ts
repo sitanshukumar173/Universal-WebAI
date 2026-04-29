@@ -425,11 +425,19 @@ export const synthesizeRelevantLinks = async (
 
     const parsed = JSON.parse(jsonText);
     if (Array.isArray(parsed)) {
-      return Array.from(
+      const unique = Array.from(
         new Set(
           parsed.filter((value): value is string => typeof value === "string"),
         ),
       ).slice(0, 3);
+
+      // If the model returned an empty array, fall back deterministically
+      // to the provided `sources` so we still show helpful links.
+      if (unique.length === 0) {
+        return Array.from(new Set(sources)).slice(0, 1);
+      }
+
+      return unique;
     }
   } catch (error) {
     const message =
