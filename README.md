@@ -18,6 +18,10 @@
     <img src="https://img.shields.io/badge/Gemini_2.5_Flash-8E75B2?style=for-the-badge&logo=googlebard&logoColor=white" alt="Gemini" />
   </p>
 
+  <h2>
+    UPDATED DOCUMENTATION LINK - https://github.com/sitanshukumar173/Universal-WebAI/blob/main/COMPLETE_DOCUMENTATION.md
+  </h2>
+
 </div>
 
 <br/>
