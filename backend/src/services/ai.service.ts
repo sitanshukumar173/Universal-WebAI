@@ -47,7 +47,6 @@ const ROLE_TERMS = [
 const cleanExtractedName = (value: string) => {
   let cleaned = value.replace(/\s+/g, " ").trim();
 
-  // Handle merged suffixes like "KumarDirectorUIET".
   const mergedRolePattern = new RegExp(`(${ROLE_TERMS.join("|")})`, "i");
   const mergedIndex = cleaned.search(mergedRolePattern);
   if (mergedIndex > 0) {
@@ -82,7 +81,6 @@ const stripAnswerBoilerplate = (value: string) => {
     .replace(/^\s*\d+[\).]\s*direct answer\s*/i, "")
     .trim();
 
-  // Drop sections like "Key facts" if model still emits them.
   const mainSection =
     text.split(
       /\n\s*(\d+[\).]\s*)?(key facts?|supporting facts?|explanation)\s*[:\-]?/i,
@@ -169,7 +167,6 @@ const extractShortAnswerFromContext = (
     " ",
   );
 
-  // High-confidence pattern: role term appears close to a person-like name.
   if (roleKeywords.length > 0) {
     const rolePattern = roleKeywords
       .map((k) => k.replace(/\s+/g, "\\s+"))
@@ -201,7 +198,6 @@ const extractShortAnswerFromContext = (
     .map((line) => line.trim())
     .filter((line) => line.length > 2);
 
-  // First preference: line that includes role keyword and a person-like name.
   for (const line of lines) {
     const lower = line.toLowerCase();
     if (
@@ -214,12 +210,10 @@ const extractShortAnswerFromContext = (
     if (person) return person;
   }
 
-  // Second preference: best context line scored by query overlap.
   const bestLine = pickBestContextLine(question, rawContext);
   const personFromBest = extractPersonName(bestLine);
   if (personFromBest) return personFromBest;
 
-  // Final fallback: any person-like name from context.
   for (const line of lines) {
     const person = extractPersonName(line);
     if (person) return person;
@@ -281,7 +275,6 @@ const generateWithFallback = async (
         );
 
         if (status === 404) {
-          // Model not available for this API version/method; skip retries for this model.
           break;
         }
 
@@ -301,7 +294,6 @@ const generateWithFallback = async (
   }
 
   if (purpose === "links") {
-    // Keep query flow healthy when all model attempts fail.
     return "[]";
   }
 
@@ -310,7 +302,6 @@ const generateWithFallback = async (
     : new Error("All AI model attempts failed");
 };
 
-//text->embedding
 export const getEmbedding = async (text: string) => {
   const genAI = getGenAI();
   const model = genAI.getGenerativeModel({
@@ -320,7 +311,6 @@ export const getEmbedding = async (text: string) => {
   return result.embedding.values;
 };
 
-//synthesize answer with ai
 export const synthesizeAnswer = async (question: string, context: string) => {
   const buildFallbackAnswer = (rawContext: string) => {
     if (shouldBeShortAnswer(question)) {
@@ -338,7 +328,6 @@ export const synthesizeAnswer = async (question: string, context: string) => {
 
   try {
     if (shouldBeShortAnswer(question)) {
-      // Prefer deterministic extraction for role/name queries.
       const deterministicAnswer = extractShortAnswerFromContext(
         question,
         context,
@@ -431,8 +420,6 @@ export const synthesizeRelevantLinks = async (
         ),
       ).slice(0, 3);
 
-      // If the model returned an empty array, fall back deterministically
-      // to the provided `sources` so we still show helpful links.
       if (unique.length === 0) {
         return Array.from(new Set(sources)).slice(0, 1);
       }
@@ -449,6 +436,5 @@ export const synthesizeRelevantLinks = async (
     );
   }
 
-  // deterministic fallback when AI is unavailable
   return Array.from(new Set(sources)).slice(0, 3);
 };

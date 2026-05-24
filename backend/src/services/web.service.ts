@@ -8,8 +8,6 @@ type CrawlLink = {
   title: string;
 };
 
-// Map all URLs of a website and save embeddings for vector search.
-// We intentionally do not set a `limit` here so Firecrawl can map the full site.
 export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
   const startedAt = Date.now();
   console.log(`[MAP][START] domain=${domain} baseUrl=${websiteUrl}`);
@@ -30,7 +28,6 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
     return;
   }
 
-  // Firecrawl may return links as string[] or object[]; normalize both formats.
   const normalizedLinks: CrawlLink[] = mapRes.links
     .map((item: any) => {
       if (typeof item === "string") {
@@ -107,8 +104,6 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
 
   await Promise.all(mapPromises);
 
-  // Mark this domain as mapped so we don't remap on every request.
-  // Upsert avoids duplicate key errors if a placeholder row already exists.
   await WebsiteModel.updateOne(
     { domain },
     { isMapped: true },
@@ -133,7 +128,6 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
   }
 };
 
-//vector serch for question asked to find top- 1 relevent link
 export const vectorSearch = async (
   questionVector: number[],
   domain: string,

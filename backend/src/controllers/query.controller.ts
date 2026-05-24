@@ -1,18 +1,14 @@
 import type { Request, Response } from "express";
 import { WebsiteModel } from "../models.js";
 import { getFirecrawl, scrapeUrlCompat } from "../scraper.js";
-import {
-  getEmbedding,
-  synthesizeAnswer,
-  synthesizeRelevantLinks,
-} from "../services/ai.service.js";
+import { getEmbedding, synthesizeAnswer } from "../services/ai.service.js";
 import type { ExtractCompatResult, VectorSearchHit } from "../types.js";
 import { mapNewWebsite, vectorSearch } from "../services/web.service.js";
 
 const mappingInProgress = new Set<string>();
+const mappingJobs = new Map<string, Promise<void>>();
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Normalize URL input to a usable absolute URL.
-// Adds https:// if protocol is missing.
 const normalizeUrlInput = (value?: string): string | null => {
   if (!value || !value.trim()) return null;
   const raw = value.trim();
@@ -28,28 +24,362 @@ const normalizeUrlInput = (value?: string): string | null => {
   }
 };
 
-// Create a safe base URL (origin/) from any valid URL input.
 const toBaseUrl = (url: string): string => {
   const parsed = new URL(url);
   return `${parsed.origin}/`;
 };
 
-//main ai query/chat route
+type QueryPayload = {
+  question: string;
+  websiteUrl: string;
+  currentPageUrl?: string;
+  baseUrl?: string;
+};
+
+type QueryProgressCallback = (event: {
+  type: "stage" | "answer_chunk" | "result" | "error";
+  data: unknown;
+}) => void;
+
+type ExtractedSource = {
+  url: string;
+  extract?: ExtractCompatResult["extract"];
+};
+
+const normalizeForMatch = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const tokenizeForMatch = (value: string) =>
+  normalizeForMatch(value)
+    .split(/\s+/)
+    .filter((token) => token.length > 2);
+
+const scoreSourceForAnswer = (answer: string, sourceText: string) => {
+  const normalizedAnswer = normalizeForMatch(answer);
+  const normalizedSource = normalizeForMatch(sourceText);
+
+  if (!normalizedAnswer || !normalizedSource) return 0;
+  if (normalizedSource.includes(normalizedAnswer)) {
+    return 1000 + normalizedAnswer.length;
+  }
+
+  const answerTokens = tokenizeForMatch(answer);
+  if (answerTokens.length === 0) return 0;
+
+  const sourceTokens = new Set(tokenizeForMatch(sourceText));
+  let score = 0;
+
+  for (const token of answerTokens) {
+    if (sourceTokens.has(token)) {
+      score += token.length >= 6 ? 3 : 1;
+    }
+  }
+
+  return score + Math.min(answerTokens.length, 5);
+};
+
+const selectAnswerSourceLinks = (
+  answer: string,
+  sources: ExtractedSource[],
+  limit = 3,
+) => {
+  const ranked = sources
+    .map((source) => {
+      const sourceText = [source.extract?.answer, source.extract?.details]
+        .filter(
+          (part): part is string =>
+            typeof part === "string" && Boolean(part.trim()),
+        )
+        .join("\n");
+
+      return {
+        url: source.url,
+        score: scoreSourceForAnswer(answer, sourceText),
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const bestMatches = ranked.filter((item) => item.score > 0).slice(0, limit);
+
+  if (bestMatches.length === 0) {
+    return Array.from(new Set(sources.map((source) => source.url))).slice(0, 1);
+  }
+
+  return Array.from(new Set(bestMatches.map((item) => item.url)));
+};
+
+const createMappingJob = (
+  domain: string,
+  normalizedBaseUrl: string,
+  requestId: string,
+  reason: "warmup" | "query",
+) => {
+  const existingJob = mappingJobs.get(domain);
+  if (existingJob) return existingJob;
+
+  const job = (async () => {
+    const siteExists = await WebsiteModel.findOne({ domain });
+    if (siteExists?.isMapped) {
+      return;
+    }
+
+    await WebsiteModel.updateOne(
+      { domain },
+      { domain, isMapped: false },
+      { upsert: true },
+    );
+
+    console.log(
+      `[QUERY][${requestId}][MAP] domain=${domain} reason=${reason} mode=queued status=started`,
+    );
+
+    await mapNewWebsite(domain, normalizedBaseUrl);
+
+    console.log(
+      `[QUERY][${requestId}][MAP] domain=${domain} reason=${reason} mode=queued status=completed`,
+    );
+  })().finally(() => {
+    mappingJobs.delete(domain);
+  });
+
+  mappingJobs.set(domain, job);
+  return job;
+};
+
+const emitSseEvent = (
+  res: Response,
+  event: "stage" | "answer_chunk" | "result" | "error",
+  data: unknown,
+) => {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+};
+
+const streamAnswer = async (
+  res: Response,
+  answer: string,
+  emit?: QueryProgressCallback,
+) => {
+  const chunks = answer.match(/.{1,24}(?:\s|$)/g) ?? [answer];
+
+  for (const chunk of chunks) {
+    emit?.({ type: "answer_chunk", data: { chunk } });
+    if (res.writableEnded) break;
+    await delay(18);
+  }
+};
+
+const runQueryPipeline = async (
+  payload: QueryPayload,
+  requestId: string,
+  emit?: QueryProgressCallback,
+) => {
+  const { question, websiteUrl, currentPageUrl, baseUrl } = payload;
+
+  const normalizedCurrentUrl =
+    normalizeUrlInput(currentPageUrl) ?? normalizeUrlInput(websiteUrl);
+  const normalizedBaseUrl =
+    normalizeUrlInput(baseUrl) ??
+    (normalizedCurrentUrl ? toBaseUrl(normalizedCurrentUrl) : null);
+
+  if (!normalizedCurrentUrl || !normalizedBaseUrl) {
+    throw new Error(
+      "Invalid URL input. Please provide a valid current/base URL.",
+    );
+  }
+
+  const domain = new URL(normalizedBaseUrl).hostname;
+  console.log(
+    `[QUERY][${requestId}][START] domain=${domain} currentUrl=${normalizedCurrentUrl} baseUrl=${normalizedBaseUrl}`,
+  );
+
+  emit?.({
+    type: "stage",
+    data: { message: "Scanning page layout ...", phase: "mapping" },
+  });
+
+  mappingInProgress.add(domain);
+  try {
+    await createMappingJob(domain, normalizedBaseUrl, requestId, "query");
+  } finally {
+    mappingInProgress.delete(domain);
+  }
+
+  emit?.({
+    type: "stage",
+    data: {
+      message: "Searching local vector storage ...",
+      phase: "vector-search",
+    },
+  });
+
+  const embeddingStartedAt = Date.now();
+  const questionVector = await getEmbedding(question);
+  console.log(
+    `[QUERY][${requestId}][EMBEDDING] durationMs=${Date.now() - embeddingStartedAt}`,
+  );
+
+  const vectorStartedAt = Date.now();
+  const candidateLinks = await vectorSearch(questionVector, domain);
+  console.log(
+    `[QUERY][${requestId}][VECTOR] candidates=${candidateLinks.length} durationMs=${Date.now() - vectorStartedAt}`,
+  );
+
+  let targetUrls: string[] = candidateLinks
+    .filter((l: VectorSearchHit) => l.score > 0.7)
+    .map((l: VectorSearchHit) => l.url);
+
+  if (targetUrls.length === 0) {
+    const fallbackStartedAt = Date.now();
+    const firecrawl = getFirecrawl();
+    const search = await firecrawl.search(`${domain} ${question}`, {
+      limit: 2,
+    });
+    targetUrls = (search.web as Array<{ url?: string | null }> | undefined)
+      ?.map((r: { url?: string | null }) => r.url)
+      .filter((url): url is string => Boolean(url)) ?? [normalizedCurrentUrl];
+    console.log(
+      `[QUERY][${requestId}][FALLBACK] urls=${targetUrls.length} durationMs=${Date.now() - fallbackStartedAt}`,
+    );
+  }
+
+  const sources = Array.from(
+    new Set([normalizedCurrentUrl, normalizedBaseUrl, ...targetUrls]),
+  );
+  console.log(`[QUERY][${requestId}][SOURCES] total=${sources.length}`);
+
+  emit?.({
+    type: "stage",
+    data: { message: "Extracting relevant evidence ...", phase: "extract" },
+  });
+
+  const extractionStartedAt = Date.now();
+  const extractionPromises = sources.map(async (url: string) => {
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Timeout")), 30000),
+    );
+
+    const scrapeJob = scrapeUrlCompat(url, {
+      formats: ["extract"],
+      extract: {
+        prompt: `Question: ${question}
+Extract the most precise factual answer from this page.
+If the question asks for a designation holder (for example director/dean/HOD), return the exact person name tied to that designation.
+Also include one short supporting line copied from the page where the answer appears.
+Prefer exact names, numbers, and dates from the page text.
+Do not add explanation.`,
+        schema: {
+          type: "object",
+          properties: {
+            answer: { type: "string" },
+            details: { type: "string" },
+            found_in_pdf: { type: "boolean" },
+          },
+          required: ["answer"],
+        },
+      },
+    });
+
+    return Promise.race([scrapeJob, timeout])
+      .then((result) => {
+        const scrapedResult = result as ExtractCompatResult | undefined;
+
+        return {
+          success: Boolean(scrapedResult?.success),
+          url,
+          extract: scrapedResult?.extract,
+        };
+      })
+      .catch((err) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[QUERY][${requestId}][EXTRACT][ERROR] url=${url} error=${errorMessage}`,
+        );
+        return {
+          success: false,
+          url,
+        };
+      });
+  });
+
+  const results = (await Promise.all(extractionPromises)).filter(
+    (result): result is ExtractedSource & { success: true } => result.success,
+  );
+  console.log(
+    `[QUERY][${requestId}][EXTRACT] success=${results.length}/${sources.length} durationMs=${Date.now() - extractionStartedAt}`,
+  );
+
+  if (results.length === 0) {
+    throw new Error("No info found");
+  }
+
+  emit?.({
+    type: "stage",
+    data: { message: "Generating AI summary ...", phase: "answer" },
+  });
+
+  const context = results
+    .map((r) => {
+      const answer =
+        typeof r.extract?.answer === "string" ? r.extract.answer.trim() : "";
+      const details =
+        typeof r.extract?.details === "string" ? r.extract.details.trim() : "";
+      return [answer, details].filter(Boolean).join("\n");
+    })
+    .filter(Boolean)
+    .join("\n---\n");
+
+  const answerStartedAt = Date.now();
+  const answer = await synthesizeAnswer(question, context);
+  console.log(
+    `[QUERY][${requestId}][ANSWER] durationMs=${Date.now() - answerStartedAt}`,
+  );
+
+  const linksStartedAt = Date.now();
+  const relevantLinks = selectAnswerSourceLinks(answer, results);
+  console.log(
+    `[QUERY][${requestId}][RELEVANT_LINKS] count=${relevantLinks.length} durationMs=${Date.now() - linksStartedAt}`,
+  );
+
+  return {
+    answer,
+    sources,
+    relevantLinks,
+  };
+};
+
 export const handleQuery = async (req: Request, res: Response) => {
   const requestStartedAt = Date.now();
   const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
   try {
-    const { question, websiteUrl, currentPageUrl, baseUrl } = req.body as {
-      question: string;
-      websiteUrl: string;
-      currentPageUrl?: string;
-      baseUrl?: string;
-    };
+    const result = await runQueryPipeline(req.body as QueryPayload, requestId);
 
-    // Backward compatible behavior:
-    // - `websiteUrl` can still be sent by old clients.
-    // - New clients can send both `currentPageUrl` and `baseUrl`.
+    console.log(
+      `[QUERY][${requestId}][DONE] status=200 totalDurationMs=${Date.now() - requestStartedAt}`,
+    );
+
+    return res.status(200).json(result);
+  } catch (error: any) {
+    if (error?.message === "No info found") {
+      return res.status(404).json({ message: "No info found" });
+    }
+
+    console.error(
+      `[QUERY][${requestId}][FAILED] totalDurationMs=${Date.now() - requestStartedAt} error=${error?.message ?? String(error)}`,
+    );
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const handleWarmup = async (req: Request, res: Response) => {
+  const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  try {
+    const { websiteUrl, currentPageUrl, baseUrl } = req.body as QueryPayload;
     const normalizedCurrentUrl =
       normalizeUrlInput(currentPageUrl) ?? normalizeUrlInput(websiteUrl);
     const normalizedBaseUrl =
@@ -57,190 +387,90 @@ export const handleQuery = async (req: Request, res: Response) => {
       (normalizedCurrentUrl ? toBaseUrl(normalizedCurrentUrl) : null);
 
     if (!normalizedCurrentUrl || !normalizedBaseUrl) {
-      console.warn(
-        `[QUERY][${requestId}][INVALID_INPUT] questionPresent=${Boolean(question)} current=${Boolean(normalizedCurrentUrl)} base=${Boolean(normalizedBaseUrl)}`,
-      );
       return res.status(400).json({
         message: "Invalid URL input. Please provide a valid current/base URL.",
       });
     }
 
-    // Domain should always come from the base site URL.
-    // This keeps domain mapping/search consistent for subpages.
     const domain = new URL(normalizedBaseUrl).hostname;
-    console.log(
-      `[QUERY][${requestId}][START] domain=${domain} currentUrl=${normalizedCurrentUrl} baseUrl=${normalizedBaseUrl}`,
-    );
-
-    //serches in database is website already exist or not
     const siteExists = await WebsiteModel.findOne({ domain });
 
-    // Start full-site mapping in background for first-time domains so the first
-    // query does not block until every page is crawled + embedded.
-    if (!siteExists?.isMapped && !mappingInProgress.has(domain)) {
-      mappingInProgress.add(domain);
-
-      // Create a placeholder entry immediately to avoid duplicate concurrent mapping starts.
-      await WebsiteModel.updateOne(
-        { domain },
-        { domain, isMapped: false },
-        { upsert: true },
-      );
-
-      console.log(
-        `[QUERY][${requestId}][MAP] domain=${domain} mode=background status=started`,
-      );
-
-      void mapNewWebsite(domain, normalizedBaseUrl)
-        .then(() => {
-          console.log(
-            `[QUERY][${requestId}][MAP] domain=${domain} mode=background status=completed`,
-          );
-        })
-        .catch((err) => {
-          const errorMessage = err instanceof Error ? err.message : String(err);
-          console.error(
-            `[QUERY][${requestId}][MAP] domain=${domain} mode=background status=failed error=${errorMessage}`,
-          );
-        })
-        .finally(() => {
-          mappingInProgress.delete(domain);
-        });
+    if (siteExists?.isMapped) {
+      return res.status(200).json({
+        status: "ready",
+        domain,
+        message: "Website mapping is already complete.",
+      });
     }
 
-    //makes embedding of question and serch in db
-    const embeddingStartedAt = Date.now();
-    const questionVector = await getEmbedding(question);
-    console.log(
-      `[QUERY][${requestId}][EMBEDDING] durationMs=${Date.now() - embeddingStartedAt}`,
-    );
-
-    const vectorStartedAt = Date.now();
-    const candidateLinks = await vectorSearch(questionVector, domain);
-    console.log(
-      `[QUERY][${requestId}][VECTOR] candidates=${candidateLinks.length} durationMs=${Date.now() - vectorStartedAt}`,
-    );
-
-    //if relevrnt link have low score(<0.7/70%) then Fallback
-    let targetUrls: string[] = candidateLinks
-      .filter((l: VectorSearchHit) => l.score > 0.7)
-      .map((l: VectorSearchHit) => l.url);
-
-    // Fallback search if vector hits are weak.
-    if (targetUrls.length === 0) {
-      const fallbackStartedAt = Date.now();
-      const firecrawl = getFirecrawl();
-      const search = await firecrawl.search(`${domain} ${question}`, {
-        limit: 2,
-      });
-      targetUrls = (search.web as Array<{ url?: string | null }> | undefined)
-        ?.map((r: { url?: string | null }) => r.url)
-        .filter((url): url is string => Boolean(url)) ?? [normalizedCurrentUrl];
-      console.log(
-        `[QUERY][${requestId}][FALLBACK] urls=${targetUrls.length} durationMs=${Date.now() - fallbackStartedAt}`,
-      );
-    }
-
-    // Priority order requested:
-    // 1) Current page URL first
-    // 2) Base URL second
-    // 3) Other discovered/vector URLs after that
-    // If current and base are same, Set keeps it only once.
-    const sources = Array.from(
-      new Set([normalizedCurrentUrl, normalizedBaseUrl, ...targetUrls]),
-    );
-    console.log(`[QUERY][${requestId}][SOURCES] total=${sources.length}`);
-
-    //actual text extraction from urls
-    const extractionStartedAt = Date.now();
-    const extractionPromises = sources.map(async (url: string) => {
-      //if text extraction takes more tehn 30s then timeout
-      const timeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Timeout")), 30000),
-      );
-
-      //actual text scrapper function call
-      const scrapeJob = scrapeUrlCompat(url, {
-        formats: ["extract"],
-        extract: {
-          prompt: `Question: ${question}
-Extract the most precise factual answer from this page.
-If the question asks for a designation holder (for example director/dean/HOD), return the exact person name tied to that designation.
-Also include one short supporting line copied from the page where the answer appears.
-Prefer exact names, numbers, and dates from the page text.
-Do not add explanation.`,
-          schema: {
-            type: "object",
-            properties: {
-              answer: { type: "string" },
-              details: { type: "string" },
-              found_in_pdf: { type: "boolean" },
-            },
-            required: ["answer"],
-          },
-        },
-      });
-
-      return Promise.race([scrapeJob, timeout]).catch((err) => {
-        const errorMessage = err instanceof Error ? err.message : String(err);
+    void createMappingJob(domain, normalizedBaseUrl, requestId, "warmup").catch(
+      (error) => {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
         console.error(
-          `[QUERY][${requestId}][EXTRACT][ERROR] url=${url} error=${errorMessage}`,
+          `[QUERY][${requestId}][WARMUP][FAILED] domain=${domain} error=${errorMessage}`,
         );
-        return {
-          success: false,
-        };
-      }) as Promise<ExtractCompatResult>;
+      },
+    );
+
+    return res.status(202).json({
+      status: mappingJobs.has(domain) ? "queued" : "started",
+      domain,
+      message: "Website mapping has started.",
     });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
 
-    const results = (await Promise.all(extractionPromises)).filter(
-      (r) => r.success,
+export const handleQueryStream = async (req: Request, res: Response) => {
+  const requestStartedAt = Date.now();
+  const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+
+  const send = (
+    event: "stage" | "answer_chunk" | "result" | "error",
+    data: unknown,
+  ) => {
+    if (res.writableEnded) return;
+    emitSseEvent(res, event, data);
+  };
+
+  const emit: QueryProgressCallback = (event) => {
+    send(event.type, event.data);
+  };
+
+  const keepAlive = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(`: ping\n\n`);
+    }
+  }, 15000);
+
+  try {
+    const result = await runQueryPipeline(
+      req.body as QueryPayload,
+      requestId,
+      emit,
     );
-    console.log(
-      `[QUERY][${requestId}][EXTRACT] success=${results.length}/${sources.length} durationMs=${Date.now() - extractionStartedAt}`,
-    );
-
-    if (results.length === 0)
-      return res.status(404).json({ message: "No info found" });
-
-    // Synthesis the extracted text(context)+question with ai to give proper ansewr
-    const context = results
-      .map((r) => {
-        const answer =
-          typeof r.extract?.answer === "string" ? r.extract.answer.trim() : "";
-        const details =
-          typeof r.extract?.details === "string"
-            ? r.extract.details.trim()
-            : "";
-        return [answer, details].filter(Boolean).join("\n");
-      })
-      .filter(Boolean)
-      .join("\n---\n");
-
-    const answerStartedAt = Date.now();
-    const answer = await synthesizeAnswer(question, context);
-    console.log(
-      `[QUERY][${requestId}][ANSWER] durationMs=${Date.now() - answerStartedAt}`,
-    );
-
-    const linksStartedAt = Date.now();
-    const relevantLinks = await synthesizeRelevantLinks(
-      question,
-      context,
-      sources,
-    );
-    console.log(
-      `[QUERY][${requestId}][RELEVANT_LINKS] count=${relevantLinks.length} durationMs=${Date.now() - linksStartedAt}`,
-    );
-
+    await streamAnswer(res, result.answer, emit);
+    send("result", result);
     console.log(
       `[QUERY][${requestId}][DONE] status=200 totalDurationMs=${Date.now() - requestStartedAt}`,
     );
-
-    return res.status(200).json({ answer, sources, relevantLinks });
+    res.end();
   } catch (error: any) {
+    const message = error?.message ?? String(error);
+    send("error", { message });
     console.error(
-      `[QUERY][${requestId}][FAILED] totalDurationMs=${Date.now() - requestStartedAt} error=${error?.message ?? String(error)}`,
+      `[QUERY][${requestId}][FAILED] totalDurationMs=${Date.now() - requestStartedAt} error=${message}`,
     );
-    res.status(500).json({ error: error.message });
+    res.end();
+  } finally {
+    clearInterval(keepAlive);
   }
 };
