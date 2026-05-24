@@ -6,8 +6,8 @@ const ANSWER_MODEL = process.env.GEMINI_ANSWER_MODEL || "gemini-2.5-flash";
 const BLOCKED_MODEL_IDS = new Set(["gemini-1.5-pro"]);
 const FALLBACK_ANSWER_MODELS = (process.env.GEMINI_ANSWER_FALLBACK_MODELS || "")
   .split(",")
-  .map((m) => m.trim())
-  .filter((m) => {
+  .map((m: string) => m.trim())
+  .filter((m: string) => {
     if (!m) return false;
     const normalized = m.toLowerCase();
     if (normalized === ANSWER_MODEL.toLowerCase()) return false;
