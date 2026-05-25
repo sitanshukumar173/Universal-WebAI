@@ -23,7 +23,9 @@
 
 ## What Universal WebAI Is
 
-Universal WebAI is a Chrome extension plus Node.js backend that answers questions about the current website.
+Universal WebAI is a universal AI chat assistant extension that attaches to any website you open.
+
+It behaves like the website's own AI assistant: you ask in chat, and it answers using the website as a whole instead of only the page currently open in your tab.
 
 It works by combining:
 
@@ -33,7 +35,7 @@ It works by combining:
 - answer synthesis with Groq
 - MongoDB Atlas Vector Search for retrieval
 
-The system is designed for large institutional portals, dense documentation sites, and pages where users usually have to click through many layers just to find a single answer.
+The system is designed for large institutional portals, dense documentation sites, and complex websites where users usually have to click through many layers just to find a single answer.
 
 ---
 

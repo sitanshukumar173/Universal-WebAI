@@ -26,7 +26,9 @@
 
 ## What This Project Does
 
-Universal WebAI is a browser extension that understands the page you are on, maps the site behind it, searches the most relevant pages, scrapes the page content, and returns a concise answer with source links.
+Universal WebAI is a universal AI chat assistant extension for any website you open. It becomes the chat assistant for that website and answers from site-wide context, not just the single page currently visible.
+
+Instead of only reading one page, it maps and searches across the whole website, gathers relevant content from multiple URLs, and then returns a concise answer with source links.
 
 The current stack is:
 
