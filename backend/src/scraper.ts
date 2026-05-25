@@ -60,41 +60,53 @@ export async function scrapeUrlCompat(
   url: string,
   request: ExtractCompatRequest,
 ): Promise<ExtractCompatResult> {
-  try {
-    const firecrawl = getFirecrawl();
-    const result = await firecrawl.scrape(url, {
-      formats: [
-        {
-          type: "json",
-          prompt: request.extract.prompt,
-          schema: request.extract.schema,
-        },
-      ],
-      onlyMainContent: true,
-    });
+  const startedAt = Date.now();
+  const hasJinaAuth = Boolean(process.env.JINA_KEY);
 
-    const json = result.json as ExtractCompatResult["extract"] | undefined;
-    if (json) {
-      return {
-        success: true,
-        extract: json,
-      };
+  try {
+    const jinaUrl = `https://r.jina.ai/${url}`;
+    const headers: Record<string, string> = {};
+
+    console.log(
+      `[JINA][SCRAPE][START] url=${url} auth=${hasJinaAuth ? "yes" : "no"}`,
+    );
+
+    if (process.env.JINA_KEY) {
+      headers.Authorization = `Bearer ${process.env.JINA_KEY}`;
     }
 
-    const markdown = (result as { markdown?: unknown }).markdown;
-    if (typeof markdown === "string" && markdown.trim()) {
-      const snippet = pickMarkdownSnippet(markdown);
+    const response = await fetch(jinaUrl, {
+      method: "GET",
+      headers,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Jina Reader request failed with ${response.status}`);
+    }
+
+    const markdown = normalizeWhitespace(await response.text()).trim();
+    const truncatedMarkdown = markdown.slice(0, 3000);
+    console.log(
+      `[JINA][SCRAPE][OK] url=${url} status=${response.status} bytes=${truncatedMarkdown.length} durationMs=${Date.now() - startedAt}`,
+    );
+
+    if (truncatedMarkdown) {
+      const snippet = pickMarkdownSnippet(truncatedMarkdown);
       if (snippet) {
         return {
           success: true,
           extract: {
             answer: snippet,
+            details: truncatedMarkdown,
           },
         };
       }
     }
   } catch (err) {
-    console.error(`Scrape failed for ${url}:`, err);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[JINA][SCRAPE][ERROR] url=${url} durationMs=${Date.now() - startedAt} error=${message}`,
+    );
   }
 
   return { success: false };

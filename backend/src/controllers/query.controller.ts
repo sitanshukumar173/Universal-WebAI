@@ -8,6 +8,10 @@ import { mapNewWebsite, vectorSearch } from "../services/web.service.js";
 const mappingInProgress = new Set<string>();
 const mappingJobs = new Map<string, Promise<void>>();
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const MAPPING_WAIT_BUDGET_MS = 2000;
+const ANSWER_CACHE_TTL_MS = 10 * 60 * 1000;
+const EXTRACT_CACHE_TTL_MS = 5 * 60 * 1000;
+const WARMUP_CACHE_TTL_MS = 15 * 60 * 1000;
 
 const normalizeUrlInput = (value?: string): string | null => {
   if (!value || !value.trim()) return null;
@@ -46,6 +50,21 @@ type ExtractedSource = {
   extract?: ExtractCompatResult["extract"];
 };
 
+type CacheEntry<T> = {
+  expiresAt: number;
+  value: T;
+};
+
+type QueryResult = {
+  answer: string;
+  sources: string[];
+  relevantLinks: string[];
+};
+
+const answerCache = new Map<string, CacheEntry<QueryResult>>();
+const extractCache = new Map<string, CacheEntry<ExtractedSource>>();
+const warmupCache = new Map<string, CacheEntry<true>>();
+
 const normalizeForMatch = (value: string) =>
   value
     .toLowerCase()
@@ -56,6 +75,33 @@ const tokenizeForMatch = (value: string) =>
   normalizeForMatch(value)
     .split(/\s+/)
     .filter((token) => token.length > 2);
+
+const getCachedValue = <T>(
+  cache: Map<string, CacheEntry<T>>,
+  key: string,
+): T | null => {
+  const hit = cache.get(key);
+  if (!hit) return null;
+
+  if (hit.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+
+  return hit.value;
+};
+
+const setCachedValue = <T>(
+  cache: Map<string, CacheEntry<T>>,
+  key: string,
+  value: T,
+  ttlMs: number,
+) => {
+  cache.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs,
+  });
+};
 
 const scoreSourceForAnswer = (answer: string, sourceText: string) => {
   const normalizedAnswer = normalizeForMatch(answer);
@@ -86,6 +132,15 @@ const selectAnswerSourceLinks = (
   sources: ExtractedSource[],
   limit = 3,
 ) => {
+  const isHomePageUrl = (value: string) => {
+    try {
+      const parsed = new URL(value);
+      return parsed.pathname === "/" && !parsed.search && !parsed.hash;
+    } catch {
+      return false;
+    }
+  };
+
   const ranked = sources
     .map((source) => {
       const sourceText = [source.extract?.answer, source.extract?.details]
@@ -103,12 +158,32 @@ const selectAnswerSourceLinks = (
     .sort((a, b) => b.score - a.score);
 
   const bestMatches = ranked.filter((item) => item.score > 0).slice(0, limit);
+  const uniqueLinks = Array.from(new Set(bestMatches.map((item) => item.url)));
 
-  if (bestMatches.length === 0) {
-    return Array.from(new Set(sources.map((source) => source.url))).slice(0, 1);
+  if (uniqueLinks.length === 0) {
+    const fallbackLinks = Array.from(
+      new Set(sources.map((source) => source.url)),
+    );
+    if (fallbackLinks.length <= 1) {
+      return fallbackLinks.slice(0, 1);
+    }
+
+    const nonHomeFallbackLinks = fallbackLinks.filter(
+      (url) => !isHomePageUrl(url),
+    );
+    return (
+      nonHomeFallbackLinks.length > 0
+        ? nonHomeFallbackLinks
+        : fallbackLinks.slice(0, 1)
+    ).slice(0, limit);
   }
 
-  return Array.from(new Set(bestMatches.map((item) => item.url)));
+  if (uniqueLinks.length <= 1) {
+    return uniqueLinks;
+  }
+
+  const nonHomeLinks = uniqueLinks.filter((url) => !isHomePageUrl(url));
+  return (nonHomeLinks.length > 0 ? nonHomeLinks : uniqueLinks).slice(0, limit);
 };
 
 const createMappingJob = (
@@ -141,6 +216,8 @@ const createMappingJob = (
     console.log(
       `[QUERY][${requestId}][MAP] domain=${domain} reason=${reason} mode=queued status=completed`,
     );
+
+    setCachedValue(warmupCache, domain, true, WARMUP_CACHE_TTL_MS);
   })().finally(() => {
     mappingJobs.delete(domain);
   });
@@ -172,6 +249,21 @@ const streamAnswer = async (
   }
 };
 
+const getWarmupReadyState = async (domain: string) => {
+  const cachedWarmup = getCachedValue(warmupCache, domain);
+  if (cachedWarmup) {
+    return true;
+  }
+
+  const siteExists = await WebsiteModel.findOne({ domain });
+  if (siteExists?.isMapped) {
+    setCachedValue(warmupCache, domain, true, WARMUP_CACHE_TTL_MS);
+    return true;
+  }
+
+  return false;
+};
+
 const runQueryPipeline = async (
   payload: QueryPayload,
   requestId: string,
@@ -192,28 +284,47 @@ const runQueryPipeline = async (
   }
 
   const domain = new URL(normalizedBaseUrl).hostname;
+  const normalizedQuestion = normalizeForMatch(question);
+  const answerCacheKey = `${domain}::${normalizedQuestion}`;
+
+  const cachedAnswer = getCachedValue(answerCache, answerCacheKey);
+  if (cachedAnswer) {
+    console.log(
+      `[QUERY][${requestId}][CACHE_HIT] type=answer domain=${domain}`,
+    );
+    emit?.({
+      type: "stage",
+      data: { message: "Serving cached result ...", phase: "cache" },
+    });
+    return cachedAnswer;
+  }
+
   console.log(
     `[QUERY][${requestId}][START] domain=${domain} currentUrl=${normalizedCurrentUrl} baseUrl=${normalizedBaseUrl}`,
   );
 
-  emit?.({
-    type: "stage",
-    data: { message: "Scanning page layout ...", phase: "mapping" },
-  });
+  const warmupReady = await getWarmupReadyState(domain);
 
-  mappingInProgress.add(domain);
-  try {
-    await createMappingJob(domain, normalizedBaseUrl, requestId, "query");
-  } finally {
-    mappingInProgress.delete(domain);
+  if (!warmupReady) {
+    emit?.({
+      type: "stage",
+      data: { message: "Scanning page layout ...", phase: "mapping" },
+    });
+
+    mappingInProgress.add(domain);
+    try {
+      await Promise.race([
+        createMappingJob(domain, normalizedBaseUrl, requestId, "query"),
+        delay(MAPPING_WAIT_BUDGET_MS),
+      ]);
+    } finally {
+      mappingInProgress.delete(domain);
+    }
   }
 
   emit?.({
     type: "stage",
-    data: {
-      message: "Searching local vector storage ...",
-      phase: "vector-search",
-    },
+    data: { message: "Gathering evidence ...", phase: "evidence" },
   });
 
   const embeddingStartedAt = Date.now();
@@ -249,15 +360,21 @@ const runQueryPipeline = async (
   const sources = Array.from(
     new Set([normalizedCurrentUrl, normalizedBaseUrl, ...targetUrls]),
   );
-  console.log(`[QUERY][${requestId}][SOURCES] total=${sources.length}`);
 
-  emit?.({
-    type: "stage",
-    data: { message: "Extracting relevant evidence ...", phase: "extract" },
-  });
+  console.log(`[QUERY][${requestId}][SOURCES] total=${sources.length}`);
 
   const extractionStartedAt = Date.now();
   const extractionPromises = sources.map(async (url: string) => {
+    const extractCacheKey = `${domain}::${normalizedQuestion}::${url}`;
+    const cachedExtract = getCachedValue(extractCache, extractCacheKey);
+    if (cachedExtract) {
+      return {
+        success: true,
+        url,
+        extract: cachedExtract.extract,
+      };
+    }
+
     const timeout = new Promise((_, reject) =>
       setTimeout(() => reject(new Error("Timeout")), 30000),
     );
@@ -292,6 +409,17 @@ Do not add explanation.`,
           url,
           extract: scrapedResult?.extract,
         };
+      })
+      .then((result) => {
+        if (result.success) {
+          setCachedValue(
+            extractCache,
+            extractCacheKey,
+            { url, extract: result.extract },
+            EXTRACT_CACHE_TTL_MS,
+          );
+        }
+        return result;
       })
       .catch((err) => {
         const errorMessage = err instanceof Error ? err.message : String(err);
@@ -344,11 +472,15 @@ Do not add explanation.`,
     `[QUERY][${requestId}][RELEVANT_LINKS] count=${relevantLinks.length} durationMs=${Date.now() - linksStartedAt}`,
   );
 
-  return {
+  const response: QueryResult = {
     answer,
     sources,
     relevantLinks,
   };
+
+  setCachedValue(answerCache, answerCacheKey, response, ANSWER_CACHE_TTL_MS);
+
+  return response;
 };
 
 export const handleQuery = async (req: Request, res: Response) => {
@@ -396,6 +528,8 @@ export const handleWarmup = async (req: Request, res: Response) => {
     const siteExists = await WebsiteModel.findOne({ domain });
 
     if (siteExists?.isMapped) {
+      setCachedValue(warmupCache, domain, true, WARMUP_CACHE_TTL_MS);
+
       return res.status(200).json({
         status: "ready",
         domain,

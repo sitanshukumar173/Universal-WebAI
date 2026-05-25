@@ -163,6 +163,31 @@ const parseSseBlock = (block) => {
     }
 };
 
+const getFriendlyFeedbackMessage = (rawMessage) => {
+    const message = typeof rawMessage === "string" ? rawMessage.trim() : "";
+
+    if (!message) {
+        return "I couldn't complete that request right now. Please try again in a moment.";
+    }
+
+    const normalized = message.toLowerCase();
+
+    if (normalized.includes("no info found") || normalized.includes("not found")) {
+        return "I couldn't find enough information on this page yet. Try rephrasing the question or wait for the page map to finish.";
+    }
+
+    if (
+        normalized.includes("timeout") ||
+        normalized.includes("network") ||
+        normalized.includes("fetch") ||
+        normalized.includes("failed to fetch")
+    ) {
+        return "The request timed out while I was gathering the answer. Please try again.";
+    }
+
+    return "I hit a temporary issue while answering. Please try again in a moment.";
+};
+
 const createAssistantMessage = (id) => ({
     id,
     role: "assistant",
@@ -177,6 +202,57 @@ const createUserMessage = (id, text) => ({
     id,
     role: "user",
     text,
+});
+
+const MessageList = React.memo(function MessageList({ messages }) {
+    return (
+        <div className="message-list">
+            {messages.map((message) => (
+                <div
+                    key={message.id}
+                    className={`message-row ${message.role === "user" ? "user" : "assistant"}`}
+                >
+                    <div className={`message-bubble ${message.role}`}>
+                        {message.role === "assistant" && message.progress ? (
+                            <div className="message-progress">{message.progress}</div>
+                        ) : null}
+
+                        <div className="message-text">
+                            {message.text || (message.role === "assistant" ? "Working ..." : "")}
+                        </div>
+
+                        {message.role === "assistant" && message.status === "streaming" && !message.text ? (
+                            <div className="inline-skeleton">
+                                <span />
+                                <span />
+                                <span />
+                            </div>
+                        ) : null}
+
+                        {Array.isArray(message.relevantLinks) && message.relevantLinks.length > 0 ? (
+                            <div className="links-block">
+                                <div className="links-title">Relevant links</div>
+                                <div className="links-list">
+                                    {message.relevantLinks.map((url, index) => (
+                                        <a
+                                            key={`${url}-${index}`}
+                                            href={url}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            className="link-item"
+                                        >
+                                            <span className="link-icon">{message.wasPdf ? "PDF" : "LINK"}</span>
+                                            <span>{url}</span>
+                                        </a>
+                                    ))}
+                                </div>
+                            </div>
+                        ) : null}
+                    </div>
+                </div>
+            ))}
+        </div>
+    );
 });
 
 export default function App() {
@@ -200,6 +276,7 @@ export default function App() {
     });
     const scrollRef = useRef(null);
     const loadingRef = useRef(false);
+    const persistTimersRef = useRef({ local: null, chrome: null });
 
     useEffect(() => {
         loadingRef.current = loading;
@@ -336,15 +413,61 @@ export default function App() {
             .map(normalizeStoredMessage)
             .filter(Boolean)
             .slice(-MAX_MESSAGES_PER_SITE);
+        const hasStreamingMessage = messages.some(
+            (message) => message.role === "assistant" && message.status === "streaming",
+        );
+        const timers = persistTimersRef.current;
 
-        const localStore = readChatStoreFromLocalStorage();
-        const nextStore = {
-            ...localStore,
-            [activeSiteKey]: normalizedMessages,
+        if (timers.local) {
+            window.clearTimeout(timers.local);
+        }
+
+        if (timers.chrome) {
+            window.clearTimeout(timers.chrome);
+        }
+
+        const persistToLocalStorage = () => {
+            const localStore = readChatStoreFromLocalStorage();
+            const nextStore = {
+                ...localStore,
+                [activeSiteKey]: normalizedMessages,
+            };
+
+            writeChatStoreToLocalStorage(nextStore);
+            return nextStore;
         };
 
-        writeChatStoreToLocalStorage(nextStore);
-        void writeChatStoreToChromeStorage(nextStore);
+        if (hasStreamingMessage) {
+            timers.local = window.setTimeout(() => {
+                persistToLocalStorage();
+            }, 800);
+
+            return () => {
+                if (timers.local) {
+                    window.clearTimeout(timers.local);
+                }
+
+                if (timers.chrome) {
+                    window.clearTimeout(timers.chrome);
+                }
+            };
+        }
+
+        const nextStore = persistToLocalStorage();
+
+        timers.chrome = window.setTimeout(() => {
+            void writeChatStoreToChromeStorage(nextStore);
+        }, 800);
+
+        return () => {
+            if (timers.local) {
+                window.clearTimeout(timers.local);
+            }
+
+            if (timers.chrome) {
+                window.clearTimeout(timers.chrome);
+            }
+        };
     }, [messages, activeSiteKey, chatReady]);
 
     useEffect(() => {
@@ -361,14 +484,14 @@ export default function App() {
                     percent: next.percent,
                 };
             });
-        }, 240);
+        }, 800);
 
         return () => window.clearInterval(timer);
     }, [tracker.scope, tracker.startedAt]);
 
     useEffect(() => {
         scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-    }, [messages, tracker.text]);
+    }, [messages]);
 
     const updateMessage = (id, updater) => {
         setMessages((previous) =>
@@ -498,7 +621,7 @@ export default function App() {
                                 data && typeof data === "object" && typeof data.message === "string"
                                     ? data.message
                                     : "Backend error";
-                            throw new Error(errorText);
+                            throw new Error(getFriendlyFeedbackMessage(errorText));
                         }
                     }
                 }
@@ -508,8 +631,8 @@ export default function App() {
                 ...message,
                 text:
                     error instanceof Error
-                        ? error.message
-                        : "Error: Backend is not responding.",
+                        ? getFriendlyFeedbackMessage(error.message)
+                        : "I couldn't complete that request right now. Please try again in a moment.",
                 status: "error",
             }));
         } finally {
@@ -633,52 +756,7 @@ export default function App() {
                         </div>
                     )}
 
-                    <div className="message-list">
-                        {messages.map((message) => (
-                            <div
-                                key={message.id}
-                                className={`message-row ${message.role === "user" ? "user" : "assistant"}`}
-                            >
-                                <div className={`message-bubble ${message.role}`}>
-                                    {message.role === "assistant" && message.progress ? (
-                                        <div className="message-progress">{message.progress}</div>
-                                    ) : null}
-
-                                    <div className="message-text">
-                                        {message.text || (message.role === "assistant" ? "Working ..." : "")}
-                                    </div>
-
-                                    {message.role === "assistant" && message.status === "streaming" && !message.text ? (
-                                        <div className="inline-skeleton">
-                                            <span />
-                                            <span />
-                                            <span />
-                                        </div>
-                                    ) : null}
-
-                                    {Array.isArray(message.relevantLinks) && message.relevantLinks.length > 0 ? (
-                                        <div className="links-block">
-                                            <div className="links-title">Relevant links</div>
-                                            <div className="links-list">
-                                                {message.relevantLinks.map((url, index) => (
-                                                    <a
-                                                        key={`${url}-${index}`}
-                                                        href={url}
-                                                        target="_blank"
-                                                        rel="noreferrer"
-                                                        className="link-item"
-                                                    >
-                                                        <span className="link-icon">{message.wasPdf ? "PDF" : "LINK"}</span>
-                                                        <span>{url}</span>
-                                                    </a>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    ) : null}
-                                </div>
-                            </div>
-                        ))}
-                    </div>
+                    <MessageList messages={messages} />
 
                     <div ref={scrollRef} />
                 </main>

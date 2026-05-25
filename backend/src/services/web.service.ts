@@ -11,6 +11,7 @@ type CrawlLink = {
 export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
   const startedAt = Date.now();
   console.log(`[MAP][START] domain=${domain} baseUrl=${websiteUrl}`);
+  const EMBEDDING_BATCH_SIZE = 12;
 
   const firecrawl = getFirecrawl();
   const mapRes = await firecrawl.map(websiteUrl, {
@@ -58,51 +59,58 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
   const total = uniqueLinks.length;
   const errorBuckets: Record<string, number> = {};
 
-  const mapPromises = uniqueLinks.map(
-    async (link: CrawlLink, index: number) => {
-      const url = link.url;
+  for (
+    let start = 0;
+    start < uniqueLinks.length;
+    start += EMBEDDING_BATCH_SIZE
+  ) {
+    const batch = uniqueLinks.slice(start, start + EMBEDDING_BATCH_SIZE);
 
-      if (!url) {
-        failed += 1;
-        processed += 1;
-        console.warn(
-          `[MAP][SKIP] domain=${domain} index=${index + 1}/${total} reason=missing-url progress=${processed}/${total}`,
-        );
-        return null;
-      }
+    await Promise.all(
+      batch.map(async (link, batchIndex) => {
+        const url = link.url;
+        const index = start + batchIndex;
 
-      try {
-        const textToEmbed = link.title || url.split("/").pop() || domain;
-        const vector = await getEmbedding(textToEmbed);
+        if (!url) {
+          failed += 1;
+          processed += 1;
+          console.warn(
+            `[MAP][SKIP] domain=${domain} index=${index + 1}/${total} reason=missing-url progress=${processed}/${total}`,
+          );
+          return null;
+        }
 
-        const result = await SitemapModel.findOneAndUpdate(
-          { url },
-          { domain, url, title: link.title || "", embedding: vector },
-          { upsert: true },
-        );
+        try {
+          const textToEmbed = link.title || url.split("/").pop() || domain;
+          const vector = await getEmbedding(textToEmbed);
 
-        success += 1;
-        processed += 1;
-        console.log(
-          `[MAP][OK] domain=${domain} index=${index + 1}/${total} progress=${processed}/${total} url=${url}`,
-        );
+          const result = await SitemapModel.findOneAndUpdate(
+            { url },
+            { domain, url, title: link.title || "", embedding: vector },
+            { upsert: true },
+          );
 
-        return result;
-      } catch (err) {
-        failed += 1;
-        processed += 1;
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        const errorKey = errorMessage.slice(0, 120) || "unknown-error";
-        errorBuckets[errorKey] = (errorBuckets[errorKey] ?? 0) + 1;
-        console.error(
-          `[MAP][ERROR] domain=${domain} index=${index + 1}/${total} progress=${processed}/${total} url=${url} error=${errorMessage}`,
-        );
-        return null;
-      }
-    },
-  );
+          success += 1;
+          processed += 1;
+          console.log(
+            `[MAP][OK] domain=${domain} index=${index + 1}/${total} progress=${processed}/${total} url=${url}`,
+          );
 
-  await Promise.all(mapPromises);
+          return result;
+        } catch (err) {
+          failed += 1;
+          processed += 1;
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          const errorKey = errorMessage.slice(0, 120) || "unknown-error";
+          errorBuckets[errorKey] = (errorBuckets[errorKey] ?? 0) + 1;
+          console.error(
+            `[MAP][ERROR] domain=${domain} index=${index + 1}/${total} progress=${processed}/${total} url=${url} error=${errorMessage}`,
+          );
+          return null;
+        }
+      }),
+    );
+  }
 
   await WebsiteModel.updateOne(
     { domain },
@@ -138,6 +146,7 @@ export const vectorSearch = async (
         index: "vector_index",
         path: "embedding",
         queryVector: questionVector,
+        filter: { domain },
         numCandidates: 50,
         limit: 1,
       },

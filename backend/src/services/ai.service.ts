@@ -1,23 +1,70 @@
 import { getGenAI } from "../scraper.js";
+import Groq from "groq-sdk";
 
 const EMBEDDING_MODEL =
   process.env.GEMINI_EMBEDDING_MODEL || "models/gemini-embedding-001";
-const ANSWER_MODEL = process.env.GEMINI_ANSWER_MODEL || "gemini-2.5-flash";
-const BLOCKED_MODEL_IDS = new Set(["gemini-1.5-pro"]);
-const FALLBACK_ANSWER_MODELS = (process.env.GEMINI_ANSWER_FALLBACK_MODELS || "")
+const GROQ_ANSWER_MODEL =
+  process.env.GROQ_ANSWER_MODEL || "llama-3.1-8b-instant";
+const GROQ_FALLBACK_MODELS = (process.env.GROQ_ANSWER_FALLBACK_MODELS || "")
   .split(",")
   .map((m: string) => m.trim())
   .filter((m: string) => {
     if (!m) return false;
     const normalized = m.toLowerCase();
-    if (normalized === ANSWER_MODEL.toLowerCase()) return false;
-    if (BLOCKED_MODEL_IDS.has(normalized)) return false;
+    if (normalized === GROQ_ANSWER_MODEL.toLowerCase()) return false;
     return true;
   });
 
 const RETRYABLE_STATUS = new Set([429, 500, 503, 504]);
+const EMBEDDING_CACHE_TTL_MS = 15 * 60 * 1000;
+
+type EmbeddingCacheEntry = {
+  expiresAt: number;
+  value: number[];
+};
+
+const embeddingCache = new Map<string, EmbeddingCacheEntry>();
+let groqClient: Groq | null = null;
+
+const getGroqClient = () => {
+  if (groqClient) {
+    return groqClient;
+  }
+
+  const apiKey = process.env.GROQ_API_KEY || process.env.GORQ_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "GROQ_API_KEY (or GORQ_KEY) environment variable is not set",
+    );
+  }
+
+  groqClient = new Groq({ apiKey });
+  return groqClient;
+};
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const normalizeEmbeddingKey = (value: string) =>
+  normalizeLineBreaks(value).toLowerCase().replace(/\s+/g, " ").trim();
+
+const getCachedEmbedding = (key: string) => {
+  const hit = embeddingCache.get(key);
+  if (!hit) return null;
+
+  if (hit.expiresAt <= Date.now()) {
+    embeddingCache.delete(key);
+    return null;
+  }
+
+  return hit.value.slice();
+};
+
+const setCachedEmbedding = (key: string, value: number[]) => {
+  embeddingCache.set(key, {
+    value: value.slice(),
+    expiresAt: Date.now() + EMBEDDING_CACHE_TTL_MS,
+  });
+};
 
 const normalizeText = (value: string) => value.replace(/\s+/g, " ").trim();
 
@@ -240,8 +287,8 @@ const generateWithFallback = async (
   purpose: "answer" | "links",
   prompt: string,
 ) => {
-  const genAI = getGenAI();
-  const modelsToTry = [ANSWER_MODEL, ...FALLBACK_ANSWER_MODELS];
+  const groq = getGroqClient();
+  const modelsToTry = [GROQ_ANSWER_MODEL, ...GROQ_FALLBACK_MODELS];
   let lastError: unknown;
 
   for (const modelName of modelsToTry) {
@@ -252,12 +299,24 @@ const generateWithFallback = async (
         console.log(
           `[AI][${purpose.toUpperCase()}][TRY] model=${modelName} attempt=${attempt}`,
         );
-        const model = genAI.getGenerativeModel({ model: modelName });
-        const result = await model.generateContent(prompt);
+        const completion = await groq.chat.completions.create({
+          model: modelName,
+          messages: [
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+          temperature: 0.2,
+        });
+        const text = completion.choices?.[0]?.message?.content?.trim() ?? "";
+        if (!text) {
+          throw new Error("Groq returned an empty response");
+        }
         console.log(
           `[AI][${purpose.toUpperCase()}][OK] model=${modelName} attempt=${attempt} durationMs=${Date.now() - startedAt}`,
         );
-        return result.response.text();
+        return text;
       } catch (error) {
         lastError = error;
         const status =
@@ -303,12 +362,20 @@ const generateWithFallback = async (
 };
 
 export const getEmbedding = async (text: string) => {
+  const cacheKey = normalizeEmbeddingKey(text).slice(0, 512);
+  const cached = getCachedEmbedding(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   const genAI = getGenAI();
   const model = genAI.getGenerativeModel({
     model: EMBEDDING_MODEL,
   });
   const result = await model.embedContent(text);
-  return result.embedding.values;
+  const values = result.embedding.values;
+  setCachedEmbedding(cacheKey, values);
+  return values.slice();
 };
 
 export const synthesizeAnswer = async (question: string, context: string) => {
@@ -327,6 +394,9 @@ export const synthesizeAnswer = async (question: string, context: string) => {
   };
 
   try {
+    const promptContext =
+      context.length > 4000 ? context.slice(0, 4000) : context;
+
     if (shouldBeShortAnswer(question)) {
       const deterministicAnswer = extractShortAnswerFromContext(
         question,
@@ -344,7 +414,7 @@ export const synthesizeAnswer = async (question: string, context: string) => {
       "${question}"
 
       Extracted website context:
-      ${context}
+      ${promptContext}
 
       Instructions:
       - Answer only from the provided context.
