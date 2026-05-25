@@ -79,8 +79,8 @@ flowchart LR
   Q --> GROQ[Groq synthesis]
   Q --> LINKS[Relevant links]
   Q --> RES[Response + SSE stream]
-  Q -->|warmup| MAP[Firecrawl map()]
-  Q -->|fallback| SEARCH[Firecrawl search()]
+  Q -->|warmup| MAP[Firecrawl map]
+  Q -->|fallback| SEARCH[Firecrawl search]
   MAP --> DB[(MongoDB)]
   VS --> DB
   UI --> STORE[localStorage + chrome.storage.local]
