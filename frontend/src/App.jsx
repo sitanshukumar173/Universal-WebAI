@@ -259,7 +259,6 @@ export default function App() {
     const [input, setInput] = useState("");
     const [messages, setMessages] = useState([]);
     const [loading, setLoading] = useState(false);
-    const [trackerExpanded, setTrackerExpanded] = useState(false);
     const [activeUrl, setActiveUrl] = useState("");
     const [activeSiteKey, setActiveSiteKey] = useState("");
     const [chatReady, setChatReady] = useState(false);
@@ -345,7 +344,6 @@ export default function App() {
                         title: "Site map ready",
                         subtitle: getHostname(activeUrl),
                     });
-                    setTrackerExpanded(false);
 
                     if (!loadingRef.current) {
                         setTracker({
@@ -643,7 +641,6 @@ export default function App() {
                 text: "Ready",
                 percent: 100,
             });
-            setTrackerExpanded(false);
         }
     };
 
@@ -651,13 +648,6 @@ export default function App() {
         tracker.scope === "idle"
             ? siteStatus.title
             : tracker.text || "Working ...";
-
-    const trackerDetail =
-        tracker.scope === "idle"
-            ? siteStatus.subtitle
-            : loading
-                ? "Your question is queued until site mapping finishes."
-                : "Preparing the page map before the next answer.";
 
     const isSkeletonVisible = messages.length === 0 && (siteStatus.state === "warming" || loading);
 
@@ -684,47 +674,19 @@ export default function App() {
                     </div>
                 </header>
 
-                <section className={`hero glass-panel ${trackerExpanded ? "expanded" : "collapsed"}`}>
-                    <button
-                        type="button"
-                        className="hero-toggle"
-                        onClick={() => setTrackerExpanded((value) => !value)}
-                        aria-expanded={trackerExpanded}
-                        aria-label={trackerExpanded ? "Collapse progress tracker" : "Expand progress tracker"}
+                <section className="hero glass-panel">
+                    <a
+                        className="site-chip"
+                        href={activeUrl || DEV_FALLBACK_URL}
+                        target="_blank"
+                        rel="noreferrer"
                     >
-                        <div className="hero-copy">
-                            <div className="site-chip">{getHostname(activeUrl || DEV_FALLBACK_URL)}</div>
-                            <h1>Fast answers with live mapping.</h1>
-                            <p>{trackerDetail}</p>
-                        </div>
+                        {getHostname(activeUrl || DEV_FALLBACK_URL)}
+                    </a>
 
-                        <div className="hero-meta">
-                            <div className="hero-meta-line">
-                                <strong>{tracker.percent}%</strong>
-                                <span className="hero-chevron">▾</span>
-                            </div>
-                            <div className="hero-mini-track">
-                                <span style={{ width: `${tracker.percent}%` }} />
-                            </div>
-                        </div>
-                    </button>
-
-                    <div className={`tracker-panel ${trackerExpanded ? "show" : "hide"}`}>
-                        <div className="tracker-card">
-                            <div className="tracker-header">
-                                <span>Live progress tracker</span>
-                                <strong>{tracker.percent}%</strong>
-                            </div>
-                            <div className="tracker-bar">
-                                <div className="tracker-fill" style={{ width: `${tracker.percent}%` }} />
-                            </div>
-                            <div className="tracker-steps">
-                                <span className={tracker.percent < 35 ? "active" : "done"}>Scanning</span>
-                                <span className={tracker.percent >= 35 && tracker.percent < 70 ? "active" : tracker.percent >= 70 ? "done" : ""}>
-                                    Search
-                                </span>
-                                <span className={tracker.percent >= 70 ? "active done" : ""}>Answer</span>
-                            </div>
+                    <div className="hero-meta">
+                        <div className="hero-mini-track" aria-label="Progress bar">
+                            <span style={{ width: `${tracker.percent}%` }} />
                         </div>
                     </div>
                 </section>

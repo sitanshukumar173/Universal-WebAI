@@ -81,6 +81,7 @@
 	background: rgba(9, 14, 27, 0.72);
 	border: 1px solid rgba(148, 163, 184, 0.14);
 	box-shadow: 0 24px 70px rgba(2, 6, 23, 0.42);
+	-webkit-backdrop-filter: blur(18px);
 	backdrop-filter: blur(18px);
 }
 
@@ -204,8 +205,8 @@
 }
 
 .hero-meta {
-	flex: 0 0 116px;
-	padding-top: 4px;
+	width: 100%;
+	padding-top: 2px;
 }
 
 .hero-meta-line {
@@ -277,9 +278,14 @@
 	border: 1px solid rgba(148, 163, 184, 0.16);
 	font-size: 0.72rem;
 	color: rgba(191, 219, 254, 0.96);
+	text-decoration: none;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
+}
+
+a.site-chip:hover {
+	color: #dbeafe;
 }
 
 .tracker-card {
