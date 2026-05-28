@@ -25,7 +25,12 @@ app.use((req: Request, res: Response, next) => {
 
 app.use(
   cors({
-    origin: ["http://localhost:5173", /^chrome-extension:\/\//],
+    origin: [
+      "http://localhost:5173",
+      "https://sitanshu17.tech",
+      "https://www.sitanshu17.tech",
+      /^chrome-extension:\/\//,
+    ],
   }),
 );
 

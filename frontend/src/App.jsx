@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const API_BASE = "http://localhost:5000/api/v1";
-const DEV_FALLBACK_URL = "https://www.cashify.in/";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000/api/v1";
+
+const DEV_FALLBACK_URL = "https://csjmu.ac.in/";
 const CHAT_STORAGE_KEY = "webai.chatByWebsite.v1";
 const MAX_MESSAGES_PER_SITE = 120;
 
