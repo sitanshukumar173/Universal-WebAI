@@ -8,6 +8,17 @@ type CrawlLink = {
   title: string;
 };
 
+const isEmbeddingQuotaError = (error: unknown) => {
+  const message =
+    error instanceof Error
+      ? error.message
+      : String((error as { message?: unknown })?.message ?? error ?? "");
+
+  return /quota exceeded|too many requests|429|embed_content_free_tier_requests|gemini-embedding/i.test(
+    message,
+  );
+};
+
 export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
   const startedAt = Date.now();
   console.log(`[MAP][START] domain=${domain} baseUrl=${websiteUrl}`);
@@ -56,6 +67,9 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
   let processed = 0;
   let success = 0;
   let failed = 0;
+  let skippedDueToQuota = 0;
+  let quotaExceeded = false;
+  let quotaErrorMessage = "";
   const total = uniqueLinks.length;
   const errorBuckets: Record<string, number> = {};
 
@@ -64,12 +78,26 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
     start < uniqueLinks.length;
     start += EMBEDDING_BATCH_SIZE
   ) {
+    if (quotaExceeded) {
+      const remaining = uniqueLinks.length - start;
+      skippedDueToQuota += remaining;
+      console.warn(
+        `[MAP][RATE_LIMIT] domain=${domain} action=stop-remaining skipped=${remaining}`,
+      );
+      break;
+    }
+
     const batch = uniqueLinks.slice(start, start + EMBEDDING_BATCH_SIZE);
 
     await Promise.all(
       batch.map(async (link, batchIndex) => {
         const url = link.url;
         const index = start + batchIndex;
+
+        if (quotaExceeded) {
+          skippedDueToQuota += 1;
+          return null;
+        }
 
         if (!url) {
           failed += 1;
@@ -101,6 +129,15 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
           failed += 1;
           processed += 1;
           const errorMessage = err instanceof Error ? err.message : String(err);
+
+          if (isEmbeddingQuotaError(err) && !quotaExceeded) {
+            quotaExceeded = true;
+            quotaErrorMessage = errorMessage;
+            console.warn(
+              `[MAP][RATE_LIMIT] domain=${domain} action=quota-detected index=${index + 1}/${total}`,
+            );
+          }
+
           const errorKey = errorMessage.slice(0, 120) || "unknown-error";
           errorBuckets[errorKey] = (errorBuckets[errorKey] ?? 0) + 1;
           console.error(
@@ -120,8 +157,14 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
 
   const elapsedMs = Date.now() - startedAt;
   console.log(
-    `[MAP][DONE] domain=${domain} total=${total} success=${success} failed=${failed} durationMs=${elapsedMs}`,
+    `[MAP][DONE] domain=${domain} total=${total} success=${success} failed=${failed} skippedDueToQuota=${skippedDueToQuota} durationMs=${elapsedMs}`,
   );
+
+  if (quotaExceeded) {
+    console.warn(
+      `[MAP][RATE_LIMIT][DONE] domain=${domain} message=${quotaErrorMessage}`,
+    );
+  }
 
   if (failed > 0) {
     const errorSummary = Object.entries(errorBuckets)

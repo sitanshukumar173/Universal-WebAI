@@ -5,6 +5,26 @@ import type { ExtractCompatRequest, ExtractCompatResult } from "./types.js";
 let firecrawl: Firecrawl | null = null;
 let genAI: GoogleGenerativeAI | null = null;
 
+const getEnvValue = (name: string) => {
+  const raw = process.env[name];
+  if (typeof raw !== "string") return "";
+  return raw.trim();
+};
+
+const resolveGeminiKey = () => {
+  const fromGeminiKey = getEnvValue("GEMINI_KEY");
+  if (fromGeminiKey) {
+    return { key: fromGeminiKey, source: "GEMINI_KEY" as const };
+  }
+
+  const fromGeminiApiKey = getEnvValue("GEMINI_API_KEY");
+  if (fromGeminiApiKey) {
+    return { key: fromGeminiApiKey, source: "GEMINI_API_KEY" as const };
+  }
+
+  return null;
+};
+
 const normalizeWhitespace = (value: string) =>
   value
     .replace(/\r\n/g, "\n")
@@ -45,10 +65,19 @@ function getFirecrawl(): Firecrawl {
 
 function getGenAI(): GoogleGenerativeAI {
   if (!genAI) {
-    if (!process.env.GEMINI_KEY) {
-      throw new Error("GEMINI_KEY environment variable is not set");
+    const resolvedGeminiKey = resolveGeminiKey();
+    if (!resolvedGeminiKey) {
+      throw new Error(
+        "Gemini key is not set. Use GEMINI_KEY or GEMINI_API_KEY in backend/.env",
+      );
     }
-    genAI = new GoogleGenerativeAI(process.env.GEMINI_KEY);
+
+    const maskedSuffix = resolvedGeminiKey.key.slice(-4);
+    console.log(
+      `[AI][GEMINI_KEY] source=${resolvedGeminiKey.source} suffix=****${maskedSuffix}`,
+    );
+
+    genAI = new GoogleGenerativeAI(resolvedGeminiKey.key);
   }
   return genAI;
 }

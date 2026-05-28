@@ -61,6 +61,68 @@ type QueryResult = {
   relevantLinks: string[];
 };
 
+const isTimeoutLikeError = (error: unknown) => {
+  const message =
+    error instanceof Error
+      ? error.message
+      : String((error as { message?: unknown })?.message ?? error ?? "");
+
+  return /timeout|timed out|aborted|network|fetch/i.test(message);
+};
+
+const isEmbeddingQuotaError = (error: unknown) => {
+  const message =
+    error instanceof Error
+      ? error.message
+      : String((error as { message?: unknown })?.message ?? error ?? "");
+
+  return /quota exceeded|too many requests|429|embed_content_free_tier_requests|gemini-embedding/i.test(
+    message,
+  );
+};
+
+const buildNoEvidenceFallback = (
+  question: string,
+  normalizedCurrentUrl: string,
+  normalizedBaseUrl: string,
+  sources: string[],
+): QueryResult => {
+  const hasQuestion =
+    typeof question === "string" && question.trim().length > 0;
+  const answer = hasQuestion
+    ? "I am still mapping this website and could not gather enough evidence yet. Please wait a few seconds and ask again."
+    : "I am still mapping this website. Please wait a few seconds and ask again.";
+
+  const fallbackLinks = Array.from(
+    new Set([normalizedCurrentUrl, normalizedBaseUrl, ...sources]),
+  ).slice(0, 3);
+
+  return {
+    answer,
+    sources,
+    relevantLinks: fallbackLinks,
+  };
+};
+
+const buildTimeoutFallbackFromPayload = (
+  payload: QueryPayload,
+): QueryResult => {
+  const normalizedCurrentUrl =
+    normalizeUrlInput(payload.currentPageUrl) ??
+    normalizeUrlInput(payload.websiteUrl) ??
+    "https://example.com/";
+
+  const normalizedBaseUrl =
+    normalizeUrlInput(payload.baseUrl) ?? toBaseUrl(normalizedCurrentUrl);
+
+  return buildNoEvidenceFallback(
+    payload.question,
+    normalizedCurrentUrl,
+    normalizedBaseUrl,
+    [normalizedCurrentUrl, normalizedBaseUrl],
+  );
+};
+
 const answerCache = new Map<string, CacheEntry<QueryResult>>();
 const extractCache = new Map<string, CacheEntry<ExtractedSource>>();
 const warmupCache = new Map<string, CacheEntry<true>>();
@@ -193,11 +255,19 @@ const createMappingJob = (
   reason: "warmup" | "query",
 ) => {
   const existingJob = mappingJobs.get(domain);
-  if (existingJob) return existingJob;
+  if (existingJob) {
+    console.log(
+      `[QUERY][${requestId}][MAP] domain=${domain} reason=${reason} mode=queued status=join-existing`,
+    );
+    return existingJob;
+  }
 
   const job = (async () => {
     const siteExists = await WebsiteModel.findOne({ domain });
     if (siteExists?.isMapped) {
+      console.log(
+        `[QUERY][${requestId}][MAP] domain=${domain} reason=${reason} mode=queued status=already-mapped`,
+      );
       return;
     }
 
@@ -241,25 +311,32 @@ const streamAnswer = async (
   emit?: QueryProgressCallback,
 ) => {
   const chunks = answer.match(/.{1,24}(?:\s|$)/g) ?? [answer];
+  console.log(`[STREAM][ANSWER] chunkCount=${chunks.length}`);
 
   for (const chunk of chunks) {
     emit?.({ type: "answer_chunk", data: { chunk } });
     if (res.writableEnded) break;
     await delay(18);
   }
+
+  console.log("[STREAM][ANSWER] completed");
 };
 
 const getWarmupReadyState = async (domain: string) => {
   const cachedWarmup = getCachedValue(warmupCache, domain);
   if (cachedWarmup) {
+    console.log(`[WARMUP][STATE] domain=${domain} source=cache ready=true`);
     return true;
   }
 
   const siteExists = await WebsiteModel.findOne({ domain });
   if (siteExists?.isMapped) {
     setCachedValue(warmupCache, domain, true, WARMUP_CACHE_TTL_MS);
+    console.log(`[WARMUP][STATE] domain=${domain} source=db ready=true`);
     return true;
   }
+
+  console.log(`[WARMUP][STATE] domain=${domain} source=db ready=false`);
 
   return false;
 };
@@ -287,6 +364,10 @@ const runQueryPipeline = async (
   const normalizedQuestion = normalizeForMatch(question);
   const answerCacheKey = `${domain}::${normalizedQuestion}`;
 
+  console.log(
+    `[QUERY][${requestId}][INPUT] domain=${domain} questionChars=${question.length}`,
+  );
+
   const cachedAnswer = getCachedValue(answerCache, answerCacheKey);
   if (cachedAnswer) {
     console.log(
@@ -304,6 +385,7 @@ const runQueryPipeline = async (
   );
 
   const warmupReady = await getWarmupReadyState(domain);
+  console.log(`[QUERY][${requestId}][WARMUP] ready=${warmupReady}`);
 
   if (!warmupReady) {
     emit?.({
@@ -313,10 +395,14 @@ const runQueryPipeline = async (
 
     mappingInProgress.add(domain);
     try {
+      console.log(
+        `[QUERY][${requestId}][MAP_WAIT] budgetMs=${MAPPING_WAIT_BUDGET_MS} status=started`,
+      );
       await Promise.race([
         createMappingJob(domain, normalizedBaseUrl, requestId, "query"),
         delay(MAPPING_WAIT_BUDGET_MS),
       ]);
+      console.log(`[QUERY][${requestId}][MAP_WAIT] status=ended`);
     } finally {
       mappingInProgress.delete(domain);
     }
@@ -327,17 +413,38 @@ const runQueryPipeline = async (
     data: { message: "Gathering evidence ...", phase: "evidence" },
   });
 
-  const embeddingStartedAt = Date.now();
-  const questionVector = await getEmbedding(question);
-  console.log(
-    `[QUERY][${requestId}][EMBEDDING] durationMs=${Date.now() - embeddingStartedAt}`,
-  );
+  let candidateLinks: VectorSearchHit[] = [];
+  try {
+    const embeddingStartedAt = Date.now();
+    const questionVector = await getEmbedding(question);
+    console.log(
+      `[QUERY][${requestId}][EMBEDDING] durationMs=${Date.now() - embeddingStartedAt}`,
+    );
 
-  const vectorStartedAt = Date.now();
-  const candidateLinks = await vectorSearch(questionVector, domain);
-  console.log(
-    `[QUERY][${requestId}][VECTOR] candidates=${candidateLinks.length} durationMs=${Date.now() - vectorStartedAt}`,
-  );
+    const vectorStartedAt = Date.now();
+    candidateLinks = await vectorSearch(questionVector, domain);
+    console.log(
+      `[QUERY][${requestId}][VECTOR] candidates=${candidateLinks.length} durationMs=${Date.now() - vectorStartedAt}`,
+    );
+  } catch (error: unknown) {
+    if (isEmbeddingQuotaError(error)) {
+      const quotaMessage =
+        error instanceof Error ? error.message : String(error ?? "unknown");
+      console.warn(
+        `[QUERY][${requestId}][EMBEDDING_QUOTA] fallback=direct-search message=${quotaMessage}`,
+      );
+      emit?.({
+        type: "stage",
+        data: {
+          message:
+            "Embedding quota reached, switching to direct site search ...",
+          phase: "fallback",
+        },
+      });
+    } else {
+      throw error;
+    }
+  }
 
   let targetUrls: string[] = candidateLinks
     .filter((l: VectorSearchHit) => l.score > 0.7)
@@ -368,12 +475,15 @@ const runQueryPipeline = async (
     const extractCacheKey = `${domain}::${normalizedQuestion}::${url}`;
     const cachedExtract = getCachedValue(extractCache, extractCacheKey);
     if (cachedExtract) {
+      console.log(`[QUERY][${requestId}][EXTRACT][CACHE_HIT] url=${url}`);
       return {
         success: true,
         url,
         extract: cachedExtract.extract,
       };
     }
+
+    console.log(`[QUERY][${requestId}][EXTRACT][START] url=${url}`);
 
     const timeout = new Promise((_, reject) =>
       setTimeout(() => reject(new Error("Timeout")), 30000),
@@ -418,6 +528,7 @@ Do not add explanation.`,
             { url, extract: result.extract },
             EXTRACT_CACHE_TTL_MS,
           );
+          console.log(`[QUERY][${requestId}][EXTRACT][OK] url=${url}`);
         }
         return result;
       })
@@ -441,7 +552,23 @@ Do not add explanation.`,
   );
 
   if (results.length === 0) {
-    throw new Error("No info found");
+    console.warn(
+      `[QUERY][${requestId}][NO_EVIDENCE] domain=${domain} sources=${sources.length} action=fallback-response`,
+    );
+    emit?.({
+      type: "stage",
+      data: {
+        message: "Still mapping this site, preparing fallback response ...",
+        phase: "fallback",
+      },
+    });
+
+    return buildNoEvidenceFallback(
+      question,
+      normalizedCurrentUrl,
+      normalizedBaseUrl,
+      sources,
+    );
   }
 
   emit?.({
@@ -509,6 +636,7 @@ export const handleQuery = async (req: Request, res: Response) => {
 
 export const handleWarmup = async (req: Request, res: Response) => {
   const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  console.log(`[WARMUP][${requestId}][START]`);
 
   try {
     const { websiteUrl, currentPageUrl, baseUrl } = req.body as QueryPayload;
@@ -519,6 +647,7 @@ export const handleWarmup = async (req: Request, res: Response) => {
       (normalizedCurrentUrl ? toBaseUrl(normalizedCurrentUrl) : null);
 
     if (!normalizedCurrentUrl || !normalizedBaseUrl) {
+      console.warn(`[WARMUP][${requestId}][INVALID_URL]`);
       return res.status(400).json({
         message: "Invalid URL input. Please provide a valid current/base URL.",
       });
@@ -529,6 +658,8 @@ export const handleWarmup = async (req: Request, res: Response) => {
 
     if (siteExists?.isMapped) {
       setCachedValue(warmupCache, domain, true, WARMUP_CACHE_TTL_MS);
+
+      console.log(`[WARMUP][${requestId}][DONE] domain=${domain} status=ready`);
 
       return res.status(200).json({
         status: "ready",
@@ -553,6 +684,9 @@ export const handleWarmup = async (req: Request, res: Response) => {
       message: "Website mapping has started.",
     });
   } catch (error: any) {
+    console.error(
+      `[WARMUP][${requestId}][FAILED] error=${error?.message ?? String(error)}`,
+    );
     return res.status(500).json({ error: error.message });
   }
 };
@@ -560,6 +694,7 @@ export const handleWarmup = async (req: Request, res: Response) => {
 export const handleQueryStream = async (req: Request, res: Response) => {
   const requestStartedAt = Date.now();
   const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  console.log(`[STREAM][${requestId}][START]`);
 
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -576,6 +711,16 @@ export const handleQueryStream = async (req: Request, res: Response) => {
   };
 
   const emit: QueryProgressCallback = (event) => {
+    if (event.type === "stage") {
+      const message =
+        typeof event.data === "object" &&
+        event.data &&
+        typeof (event.data as { message?: unknown }).message === "string"
+          ? (event.data as { message: string }).message
+          : "unknown-stage";
+      console.log(`[QUERY][${requestId}][STAGE] ${message}`);
+    }
+
     send(event.type, event.data);
   };
 
@@ -594,11 +739,43 @@ export const handleQueryStream = async (req: Request, res: Response) => {
     await streamAnswer(res, result.answer, emit);
     send("result", result);
     console.log(
+      `[STREAM][${requestId}][RESULT] links=${result.relevantLinks.length} answerChars=${result.answer.length}`,
+    );
+    console.log(
       `[QUERY][${requestId}][DONE] status=200 totalDurationMs=${Date.now() - requestStartedAt}`,
     );
     res.end();
   } catch (error: any) {
     const message = error?.message ?? String(error);
+
+    if (isEmbeddingQuotaError(error)) {
+      console.warn(
+        `[STREAM][${requestId}][RECOVERED_EMBEDDING_QUOTA] message=${message}`,
+      );
+      send("stage", {
+        message:
+          "Embedding quota reached, returning a fallback response using direct search ...",
+        phase: "fallback",
+      });
+      send("result", buildTimeoutFallbackFromPayload(req.body as QueryPayload));
+      res.end();
+      return;
+    }
+
+    if (isTimeoutLikeError(error)) {
+      console.warn(
+        `[STREAM][${requestId}][RECOVERED_TIMEOUT] message=${message}`,
+      );
+      send("stage", {
+        message:
+          "This is taking longer than expected. Returning a fallback response ...",
+        phase: "fallback",
+      });
+      send("result", buildTimeoutFallbackFromPayload(req.body as QueryPayload));
+      res.end();
+      return;
+    }
+
     send("error", { message });
     console.error(
       `[QUERY][${requestId}][FAILED] totalDurationMs=${Date.now() - requestStartedAt} error=${message}`,
@@ -606,5 +783,8 @@ export const handleQueryStream = async (req: Request, res: Response) => {
     res.end();
   } finally {
     clearInterval(keepAlive);
+    console.log(
+      `[STREAM][${requestId}][END] totalDurationMs=${Date.now() - requestStartedAt}`,
+    );
   }
 };

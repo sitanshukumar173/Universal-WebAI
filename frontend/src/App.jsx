@@ -173,7 +173,7 @@ const getFriendlyFeedbackMessage = (rawMessage) => {
     const normalized = message.toLowerCase();
 
     if (normalized.includes("no info found") || normalized.includes("not found")) {
-        return "I couldn't find enough information on this page yet. Try rephrasing the question or wait for the page map to finish.";
+        return "I am still mapping this website and need a little more time to gather evidence. Please ask again in a few seconds.";
     }
 
     if (
@@ -182,7 +182,19 @@ const getFriendlyFeedbackMessage = (rawMessage) => {
         normalized.includes("fetch") ||
         normalized.includes("failed to fetch")
     ) {
-        return "The request timed out while I was gathering the answer. Please try again.";
+        return "Still gathering evidence from the site. Please wait a few seconds and ask again.";
+    }
+
+    if (normalized.includes("gemini_key") || normalized.includes("groq_api_key") || normalized.includes("firecrawl_key")) {
+        return "A backend API key is missing. Check backend terminal logs for the missing environment variable.";
+    }
+
+    if (normalized.includes("vector") || normalized.includes("mongodb") || normalized.includes("atlas")) {
+        return "Search index is not ready yet for this domain. Let mapping complete and try again.";
+    }
+
+    if (normalized.includes("quota") || normalized.includes("too many requests") || normalized.includes("429")) {
+        return "AI quota is temporarily exhausted, so I switched to a slower fallback search. Please try again shortly.";
     }
 
     return "I hit a temporary issue while answering. Please try again in a moment.";
@@ -218,10 +230,10 @@ const MessageList = React.memo(function MessageList({ messages }) {
                         ) : null}
 
                         <div className="message-text">
-                            {message.text || (message.role === "assistant" ? "Working ..." : "")}
+                            {message.text || (message.role === "assistant" ? "Thinking ..." : "")}
                         </div>
 
-                        {message.role === "assistant" && message.status === "streaming" && !message.text ? (
+                        {message.role === "assistant" && (message.status === "streaming" || message.status === "retrying") && !message.text ? (
                             <div className="inline-skeleton">
                                 <span />
                                 <span />
@@ -556,6 +568,7 @@ export default function App() {
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = "";
+                let streamErrored = false;
 
                 while (true) {
                     const { value, done } = await reader.read();
@@ -576,6 +589,8 @@ export default function App() {
                         if (eventType === "stage" && data && typeof data === "object") {
                             const stageText = data.message || "Working ...";
                             const stagePercent = typeof data.percent === "number" ? data.percent : undefined;
+
+                            console.info("[WEBAI][SSE][STAGE]", stageText);
 
                             setTracker((current) => ({
                                 ...current,
@@ -619,19 +634,42 @@ export default function App() {
                                 data && typeof data === "object" && typeof data.message === "string"
                                     ? data.message
                                     : "Backend error";
-                            throw new Error(getFriendlyFeedbackMessage(errorText));
+
+                            const friendlyMessage = getFriendlyFeedbackMessage(errorText);
+                            console.error("[WEBAI][SSE][ERROR]", errorText);
+
+                            updateMessage(assistantId, (message) => ({
+                                ...message,
+                                text: "",
+                                progress: friendlyMessage,
+                                status: "retrying",
+                            }));
+
+                            setTracker((current) => ({
+                                ...current,
+                                text: friendlyMessage,
+                                percent: Math.max(current.percent || 0, 62),
+                            }));
+
+                            streamErrored = true;
+                            break;
                         }
+                    }
+
+                    if (streamErrored) {
+                        break;
                     }
                 }
             }
         } catch (error) {
             updateMessage(assistantId, (message) => ({
                 ...message,
-                text:
+                text: "",
+                progress:
                     error instanceof Error
                         ? getFriendlyFeedbackMessage(error.message)
                         : "I couldn't complete that request right now. Please try again in a moment.",
-                status: "error",
+                status: "retrying",
             }));
         } finally {
             setLoading(false);
