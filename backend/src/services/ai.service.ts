@@ -24,6 +24,7 @@ type EmbeddingCacheEntry = {
 };
 
 const embeddingCache = new Map<string, EmbeddingCacheEntry>();
+const embeddingPending = new Map<string, Promise<number[]>>();
 let groqClient: Groq | null = null;
 
 const getGroqClient = () => {
@@ -71,11 +72,25 @@ const normalizeText = (value: string) => value.replace(/\s+/g, " ").trim();
 const normalizeLineBreaks = (value: string) =>
   value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
+const sanitizeQuestionText = (value: string) => {
+  return normalizeLineBreaks(value)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/[!?]+/g, " ")
+    .replace(/[“”'"`^~<>*|#@$_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
+export const sanitizeQuestionForPrompt = (value: string) => {
+  const sanitized = sanitizeQuestionText(value);
+  return sanitized.length > 0 ? sanitized : value.replace(/\s+/g, " ").trim();
+};
+
 const truncate = (value: string, maxChars: number) =>
   value.length > maxChars ? `${value.slice(0, maxChars)}...` : value;
 
 const isInsufficientAnswer = (value: string) =>
-  /(not explicitly|insufficient|not provided|not available|cannot be determined|not mentioned|not stated|unable to find)/i.test(
+  /(not explicitly|insufficient|not provided|not available|cannot be determined|not mentioned|not stated|not specified|unable to find|not found)/i.test(
     value,
   );
 
@@ -140,6 +155,16 @@ const stripAnswerBoilerplate = (value: string) => {
     .filter(Boolean)
     .join("\n")
     .trim();
+};
+
+const isImageOrUrlAnswer = (value: string) => {
+  const trimmed = value.trim();
+  return (
+    /^!\[[^\]]*\]\([^\)]+\)$/s.test(trimmed) ||
+    /^https?:\/\//i.test(trimmed) ||
+    /^\*?\s*\[[^\]]+\]\([^\)]+\)\s*$/s.test(trimmed) ||
+    /\[[^\]]+\]\([^\)]+\)/.test(trimmed)
+  );
 };
 
 const pickBestContextLine = (question: string, rawContext: string) => {
@@ -361,45 +386,69 @@ const generateWithFallback = async (
     : new Error("All AI model attempts failed");
 };
 
-export const getEmbedding = async (text: string) => {
+export const getEmbedding = async (text: string, keyIndex?: number) => {
   const cacheKey = normalizeEmbeddingKey(text).slice(0, 512);
   const cached = getCachedEmbedding(cacheKey);
   if (cached) {
     return cached;
   }
 
-  const genAI = getGenAI();
-  const model = genAI.getGenerativeModel({
-    model: EMBEDDING_MODEL,
-  });
-  const result = await model.embedContent(text);
-  const values = result.embedding.values;
-  setCachedEmbedding(cacheKey, values);
-  return values.slice();
+  const pending = embeddingPending.get(cacheKey);
+  if (pending) {
+    return pending.then((value) => value.slice());
+  }
+
+  const request = (async () => {
+    const genAI =
+      typeof keyIndex === "number" ? getGenAI({ keyIndex }) : getGenAI();
+    const model = genAI.getGenerativeModel({
+      model: EMBEDDING_MODEL,
+    });
+    const result = await model.embedContent(text);
+    const values = result.embedding.values;
+    setCachedEmbedding(cacheKey, values);
+    return values.slice();
+  })();
+
+  embeddingPending.set(cacheKey, request);
+
+  try {
+    return await request;
+  } finally {
+    embeddingPending.delete(cacheKey);
+  }
 };
 
 export const synthesizeAnswer = async (question: string, context: string) => {
+  const sanitizedQuestion = sanitizeQuestionForPrompt(question);
+
   const buildFallbackAnswer = (rawContext: string) => {
-    if (shouldBeShortAnswer(question)) {
-      const shortAnswer = extractShortAnswerFromContext(question, rawContext);
-      if (shortAnswer) return shortAnswer;
+    if (shouldBeShortAnswer(sanitizedQuestion)) {
+      const shortAnswer = extractShortAnswerFromContext(
+        sanitizedQuestion,
+        rawContext,
+      );
+      if (shortAnswer && !isImageOrUrlAnswer(shortAnswer)) return shortAnswer;
     }
 
-    const bestLine = pickBestContextLine(question, rawContext);
+    const bestLine = pickBestContextLine(sanitizedQuestion, rawContext);
     if (bestLine) {
-      return stripAnswerBoilerplate(bestLine);
+      const stripped = stripAnswerBoilerplate(bestLine);
+      if (!isImageOrUrlAnswer(stripped)) {
+        return stripped;
+      }
     }
 
-    return "No AI answer is available right now.";
+    return `Check the official links below for ${sanitizedQuestion}.`;
   };
 
   try {
     const promptContext =
       context.length > 4000 ? context.slice(0, 4000) : context;
 
-    if (shouldBeShortAnswer(question)) {
+    if (shouldBeShortAnswer(sanitizedQuestion)) {
       const deterministicAnswer = extractShortAnswerFromContext(
-        question,
+        sanitizedQuestion,
         context,
       );
       if (deterministicAnswer) {
@@ -411,14 +460,17 @@ export const synthesizeAnswer = async (question: string, context: string) => {
       You are a strict factual assistant.
 
       User question:
-      "${question}"
+      "${sanitizedQuestion}"
 
       Extracted website context:
       ${promptContext}
 
       Instructions:
-      - Answer only from the provided context.
-      - If the context is insufficient, clearly say what is missing.
+      - Answer only from the provided context and the official links already gathered.
+      - Never say "not found", "could not find", "not specified", "not available", or similar no-answer phrasing.
+      - Always return a normal, question-aware answer that tells the user the relevant official link(s) to check.
+      - If the exact detail is present, state it directly.
+      - If the detail is not explicit, give the best official page or PDF evidence from the context instead of refusing.
       - Prefer exact facts, numbers, dates, names, and conditions.
       - Keep the final answer concise, refined, and directly useful.
       - If multiple extracted snippets conflict, mention the conflict briefly.
@@ -433,13 +485,22 @@ export const synthesizeAnswer = async (question: string, context: string) => {
     const text = await generateWithFallback("answer", prompt);
     const cleaned = stripAnswerBoilerplate(text);
 
-    if (!cleaned) {
+    if (
+      !cleaned ||
+      isImageOrUrlAnswer(cleaned) ||
+      /no information found|not enough evidence|could not find|not specified|not found/i.test(
+        cleaned,
+      )
+    ) {
       return buildFallbackAnswer(context);
     }
 
-    if (shouldBeShortAnswer(question)) {
+    if (shouldBeShortAnswer(sanitizedQuestion)) {
       if (isInsufficientAnswer(cleaned)) {
-        const shortAnswer = extractShortAnswerFromContext(question, context);
+        const shortAnswer = extractShortAnswerFromContext(
+          sanitizedQuestion,
+          context,
+        );
         if (shortAnswer) return shortAnswer;
       }
 
@@ -465,8 +526,9 @@ export const synthesizeRelevantLinks = async (
   sources: string[],
 ) => {
   try {
+    const sanitizedQuestion = sanitizeQuestionForPrompt(question);
     const prompt = `
-      The user asked: "${question}"
+      The user asked: "${sanitizedQuestion}"
       Extracted website data: ${context}
       Allowed links:
       ${sources.join("\n")}
@@ -507,4 +569,43 @@ export const synthesizeRelevantLinks = async (
   }
 
   return Array.from(new Set(sources)).slice(0, 3);
+};
+
+export const isSolidAnswer = (
+  answer: string,
+  question: string,
+  context: string,
+) => {
+  const sanitizedQuestion = sanitizeQuestionForPrompt(question);
+
+  if (!answer || !answer.trim()) return false;
+  if (isInsufficientAnswer(answer)) return false;
+  if (/^!\[[^\]]*\]\([^\)]+\)$/s.test(answer.trim())) return false;
+  if (/^https?:\/\//i.test(answer.trim())) return false;
+
+  if (
+    /no ai answer is available|no ai answer|not found/i.test(
+      answer.toLowerCase(),
+    )
+  ) {
+    return false;
+  }
+
+  if (shouldBeShortAnswer(sanitizedQuestion)) {
+    const person = extractPersonName(answer) || extractPersonName(context);
+    return Boolean(person && person.length > 1);
+  }
+
+  if (
+    /(date|dates|deadline|last date|admission|admit|admission dates)/i.test(
+      sanitizedQuestion,
+    )
+  ) {
+    const dateRegex =
+      /\b(?:\d{1,2}(?:st|nd|rd|th)?\s(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}\/\d{1,2}\/\d{2,4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b/i;
+    if (dateRegex.test(answer)) return true;
+    return false;
+  }
+
+  return answer.trim().length >= 12;
 };

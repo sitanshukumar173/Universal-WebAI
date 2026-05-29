@@ -1,9 +1,22 @@
 import type { Request, Response } from "express";
-import { WebsiteModel } from "../models.js";
+import { WebsiteModel, SitemapModel } from "../models.js";
 import { getFirecrawl, scrapeUrlCompat } from "../scraper.js";
-import { getEmbedding, synthesizeAnswer } from "../services/ai.service.js";
+import {
+  getEmbedding,
+  synthesizeAnswer,
+  synthesizeRelevantLinks,
+  isSolidAnswer,
+  sanitizeQuestionForPrompt,
+} from "../services/ai.service.js";
 import type { ExtractCompatResult, VectorSearchHit } from "../types.js";
-import { mapNewWebsite, vectorSearch } from "../services/web.service.js";
+import {
+  extractUrlsFromText,
+  indexUrls,
+  mapNewWebsite,
+  rankLinksForQuestion,
+  vectorSearch,
+  vectorSearchWithinUrls,
+} from "../services/web.service.js";
 
 const mappingInProgress = new Set<string>();
 const mappingJobs = new Map<string, Promise<void>>();
@@ -12,6 +25,18 @@ const MAPPING_WAIT_BUDGET_MS = 2000;
 const ANSWER_CACHE_TTL_MS = 10 * 60 * 1000;
 const EXTRACT_CACHE_TTL_MS = 5 * 60 * 1000;
 const WARMUP_CACHE_TTL_MS = 15 * 60 * 1000;
+const QUERY_SEED_LIMIT = Number(process.env.QUERY_SEED_LIMIT || 4);
+const QUERY_LAYER_LIMIT = Number(process.env.QUERY_LAYER_LIMIT || 2);
+const QUERY_SYNC_INDEX_LIMIT = Number(process.env.QUERY_SYNC_INDEX_LIMIT || 24);
+const QUERY_BACKGROUND_INDEX_LIMIT = Number(
+  process.env.QUERY_BACKGROUND_INDEX_LIMIT || 64,
+);
+const QUERY_DISCOVERY_LIMIT = Number(process.env.QUERY_DISCOVERY_LIMIT || 12);
+const QUERY_SECOND_LAYER_LIMIT = Number(
+  process.env.QUERY_SECOND_LAYER_LIMIT || 8,
+);
+
+const indexingJobs = new Map<string, Promise<void>>();
 
 const normalizeUrlInput = (value?: string): string | null => {
   if (!value || !value.trim()) return null;
@@ -31,6 +56,130 @@ const normalizeUrlInput = (value?: string): string | null => {
 const toBaseUrl = (url: string): string => {
   const parsed = new URL(url);
   return `${parsed.origin}/`;
+};
+
+const isSameSiteUrl = (value: string, domain: string) => {
+  try {
+    const parsed = new URL(value);
+    return parsed.hostname === domain || parsed.hostname.endsWith(`.${domain}`);
+  } catch {
+    return false;
+  }
+};
+
+const dedupeUrls = (values: string[]) => Array.from(new Set(values));
+
+const collectTextLinks = (chunks: Array<string | undefined>) =>
+  dedupeUrls(
+    chunks.flatMap((chunk) => (chunk ? extractUrlsFromText(chunk) : [])),
+  );
+
+const scoreUrlForQuestion = (question: string, url: string) => {
+  const tokens = question
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 2);
+
+  if (tokens.length === 0) return 0;
+
+  const normalized = url.toLowerCase();
+  let score = 0;
+  for (const token of tokens) {
+    if (normalized.includes(token)) {
+      score += token.length >= 5 ? 2 : 1;
+    }
+  }
+
+  return score;
+};
+
+const rankUrlsForQuestion = (
+  question: string,
+  urls: string[],
+  limit: number,
+) => {
+  return [...urls]
+    .map((url) => ({ url, score: scoreUrlForQuestion(question, url) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((item) => item.url);
+};
+
+const queueBackgroundIndexing = (domain: string, urls: string[]) => {
+  const uniqueUrls = dedupeUrls(
+    urls.filter((url) => Boolean(url) && isSameSiteUrl(url, domain)),
+  ).slice(0, QUERY_BACKGROUND_INDEX_LIMIT);
+
+  if (uniqueUrls.length === 0) {
+    return Promise.resolve();
+  }
+
+  const existing = indexingJobs.get(domain) ?? Promise.resolve();
+  const job = existing
+    .then(() =>
+      indexUrls(
+        domain,
+        uniqueUrls.map((url) => ({ url, title: "" })),
+        { workerCount: 2, maxUrls: QUERY_BACKGROUND_INDEX_LIMIT },
+      ),
+    )
+    .then(() => undefined)
+    .finally(() => {
+      if (indexingJobs.get(domain) === job) {
+        indexingJobs.delete(domain);
+      }
+    });
+
+  indexingJobs.set(domain, job);
+  return job;
+};
+
+const discoverOutgoingLinks = async (
+  urls: string[],
+  domain: string,
+  requestId: string,
+) => {
+  if (urls.length === 0) {
+    return [];
+  }
+
+  const firecrawl = getFirecrawl({ preference: "primary" });
+  const discovered: string[] = [];
+
+  for (const url of urls.slice(0, QUERY_DISCOVERY_LIMIT)) {
+    try {
+      const result = await firecrawl.map(url, {
+        sitemap: "skip",
+        ignoreQueryParameters: true,
+        includeSubdomains: false,
+        limit: QUERY_DISCOVERY_LIMIT,
+        timeout: 30,
+      });
+
+      const mappedUrls =
+        result.links
+          ?.map((item: any) => {
+            if (typeof item === "string") return item;
+            if (item && typeof item.url === "string") return item.url;
+            return null;
+          })
+          .filter((item): item is string => Boolean(item)) ?? [];
+
+      discovered.push(
+        ...mappedUrls.filter((candidate) => isSameSiteUrl(candidate, domain)),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[QUERY][${requestId}][DISCOVERY] url=${url} mode=firecrawl error=${message}`,
+      );
+    }
+  }
+
+  return dedupeUrls(discovered).filter((candidate) =>
+    isSameSiteUrl(candidate, domain),
+  );
 };
 
 type QueryPayload = {
@@ -59,6 +208,8 @@ type QueryResult = {
   answer: string;
   sources: string[];
   relevantLinks: string[];
+  secondLevelLinks?: string[];
+  isSolidAnswer?: boolean;
 };
 
 const isTimeoutLikeError = (error: unknown) => {
@@ -86,12 +237,13 @@ const buildNoEvidenceFallback = (
   normalizedCurrentUrl: string,
   normalizedBaseUrl: string,
   sources: string[],
+  secondLevelLinks: string[] = [],
 ): QueryResult => {
   const hasQuestion =
     typeof question === "string" && question.trim().length > 0;
   const answer = hasQuestion
-    ? "I am still mapping this website and could not gather enough evidence yet. Please wait a few seconds and ask again."
-    : "I am still mapping this website. Please wait a few seconds and ask again.";
+    ? `For ${question}, check the official links below for the exact details.`
+    : "Check the official links below for the exact details.";
 
   const fallbackLinks = Array.from(
     new Set([normalizedCurrentUrl, normalizedBaseUrl, ...sources]),
@@ -101,6 +253,7 @@ const buildNoEvidenceFallback = (
     answer,
     sources,
     relevantLinks: fallbackLinks,
+    secondLevelLinks: Array.from(new Set(secondLevelLinks)).slice(0, 3),
   };
 };
 
@@ -248,6 +401,41 @@ const selectAnswerSourceLinks = (
   return (nonHomeLinks.length > 0 ? nonHomeLinks : uniqueLinks).slice(0, limit);
 };
 
+const describeLinkType = (url: string) => {
+  const normalized = url.toLowerCase();
+  if (/\.pdf(?:[?#]|$)/i.test(normalized)) return "PDF";
+  if (/brochure|prospectus|booklet/i.test(normalized)) return "brochure";
+  if (/b\.?tech|btech|uiet|engineering/i.test(normalized)) {
+    return "B.Tech admissions page";
+  }
+  if (/admission|admissions|apply|application/i.test(normalized)) {
+    return "admissions page";
+  }
+  return "official page";
+};
+
+const buildUnconfirmedAnswer = (
+  question: string,
+  firstLevelLinks: string[],
+  secondLevelLinks: string[],
+) => {
+  const firstLevel = Array.from(new Set(firstLevelLinks)).slice(0, 3);
+  const secondLevel = Array.from(new Set(secondLevelLinks)).slice(0, 3);
+
+  const hintLinks = [...firstLevel, ...secondLevel].slice(0, 3);
+  const hints = hintLinks
+    .map((url) => describeLinkType(url))
+    .filter((value, index, arr) => arr.indexOf(value) === index)
+    .slice(0, 3)
+    .join(", ");
+
+  return {
+    answer: `Official information for ${question} is available in the links below. Check the ${hints || "official pages"} for the exact details.`,
+    relevantLinks: firstLevel,
+    secondLevelLinks: secondLevel,
+  };
+};
+
 const createMappingJob = (
   domain: string,
   normalizedBaseUrl: string,
@@ -362,6 +550,7 @@ const runQueryPipeline = async (
 
   const domain = new URL(normalizedBaseUrl).hostname;
   const normalizedQuestion = normalizeForMatch(question);
+  const sanitizedQuestion = sanitizeQuestionForPrompt(question);
   const answerCacheKey = `${domain}::${normalizedQuestion}`;
 
   console.log(
@@ -414,9 +603,10 @@ const runQueryPipeline = async (
   });
 
   let candidateLinks: VectorSearchHit[] = [];
+  let questionVector: number[] | null = null;
   try {
     const embeddingStartedAt = Date.now();
-    const questionVector = await getEmbedding(question);
+    questionVector = await getEmbedding(question);
     console.log(
       `[QUERY][${requestId}][EMBEDDING] durationMs=${Date.now() - embeddingStartedAt}`,
     );
@@ -453,8 +643,8 @@ const runQueryPipeline = async (
   if (targetUrls.length === 0) {
     const fallbackStartedAt = Date.now();
     const firecrawl = getFirecrawl();
-    const search = await firecrawl.search(`${domain} ${question}`, {
-      limit: 2,
+    const search = await firecrawl.search(`${domain} ${sanitizedQuestion}`, {
+      limit: QUERY_SEED_LIMIT,
     });
     targetUrls = (search.web as Array<{ url?: string | null }> | undefined)
       ?.map((r: { url?: string | null }) => r.url)
@@ -492,7 +682,7 @@ const runQueryPipeline = async (
     const scrapeJob = scrapeUrlCompat(url, {
       formats: ["extract"],
       extract: {
-        prompt: `Question: ${question}
+        prompt: `Question: ${sanitizedQuestion}
 Extract the most precise factual answer from this page.
 If the question asks for a designation holder (for example director/dean/HOD), return the exact person name tied to that designation.
 Also include one short supporting line copied from the page where the answer appears.
@@ -555,19 +745,13 @@ Do not add explanation.`,
     console.warn(
       `[QUERY][${requestId}][NO_EVIDENCE] domain=${domain} sources=${sources.length} action=fallback-response`,
     );
-    emit?.({
-      type: "stage",
-      data: {
-        message: "Still mapping this site, preparing fallback response ...",
-        phase: "fallback",
-      },
-    });
-
+    const topSecondLevelLinks = dedupeUrls(targetUrls).slice(0, 3);
     return buildNoEvidenceFallback(
       question,
       normalizedCurrentUrl,
       normalizedBaseUrl,
       sources,
+      topSecondLevelLinks,
     );
   }
 
@@ -594,15 +778,183 @@ Do not add explanation.`,
   );
 
   const linksStartedAt = Date.now();
-  const relevantLinks = selectAnswerSourceLinks(answer, results);
+  const firstLevelRelevantLinks = selectAnswerSourceLinks(answer, results);
+  let relevantLinks = firstLevelRelevantLinks.slice();
   console.log(
     `[QUERY][${requestId}][RELEVANT_LINKS] count=${relevantLinks.length} durationMs=${Date.now() - linksStartedAt}`,
   );
 
+  const solid = isSolidAnswer(answer, question, context);
+  if (solid) {
+    const response: QueryResult = {
+      answer,
+      sources,
+      relevantLinks,
+      isSolidAnswer: true,
+    };
+
+    setCachedValue(answerCache, answerCacheKey, response, ANSWER_CACHE_TTL_MS);
+    return response;
+  }
+
+  // First-pass answer wasn't solid — run a focused second-layer scrape/index
+  emit?.({
+    type: "stage",
+    data: {
+      message: "Running deeper focused scrape...",
+      phase: "second-layer",
+    },
+  });
+
+  // Build a wider prioritized candidate list for second-layer scraping:
+  // 1) links that look like admissions or PDFs
+  // 2) relevant AI-picked links
+  // 3) any links extracted from first-pass extracts
+  const SECOND_LAYER_BREADTH = Number(
+    process.env.QUERY_SECOND_LAYER_BREADTH || 3,
+  );
+
+  const candidates = new Set<string>();
+
+  // priority: admissions/pdf links from the initial sources
+  for (const s of sources) {
+    if (!s) continue;
+    if (
+      /admiss|admit|application|deadline|date/i.test(s) ||
+      /\.pdf(?:[?#]|$)/i.test(s)
+    ) {
+      candidates.add(s);
+    }
+  }
+
+  // then include relevantLinks
+  for (const s of relevantLinks) candidates.add(s);
+
+  // extract any additional links from result extracts (answers/details)
+  const discovered = collectTextLinks(
+    results.map((r) =>
+      [r.extract?.answer, r.extract?.details].filter(Boolean).join("\n"),
+    ),
+  );
+  for (const d of discovered) candidates.add(d);
+
+  // ranking: put PDF/admission URLs first, then those present in relevantLinks, then others
+  const scored = Array.from(candidates).map((url) => {
+    const score =
+      (/admiss|admit|application|deadline|date/i.test(url) ? 100 : 0) +
+      (/\.pdf(?:[?#]|$)/i.test(url) ? 80 : 0) +
+      (relevantLinks.includes(url) ? 20 : 0);
+    return { url, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const secondLayerLinks = scored
+    .map((s) => s.url)
+    .slice(0, SECOND_LAYER_BREADTH);
+  const secondContextChunks: string[] = [];
+
+  for (const url of secondLayerLinks) {
+    try {
+      console.log(
+        `[QUERY][${requestId}][SECOND_LAYER][SCRAPE_START] url=${url}`,
+      );
+      emit?.({
+        type: "stage",
+        data: { message: `Scraping ${url}`, phase: "second-layer-scrape" },
+      });
+      const scrape = await scrapeUrlCompat(url, {
+        formats: ["extract"],
+        extract: {
+          prompt: `Question: ${sanitizedQuestion}\nExtract the most precise factual answer from this page. Prefer exact names, numbers, dates, and PDF evidence. Return only the extracted answer and one supporting line.`,
+          schema: {
+            type: "object",
+            properties: {
+              answer: { type: "string" },
+              details: { type: "string" },
+              found_in_pdf: { type: "boolean" },
+            },
+            required: ["answer"],
+          },
+        },
+      });
+
+      const extracted = (scrape as ExtractCompatResult | undefined)?.extract;
+      console.log(
+        `[QUERY][${requestId}][SECOND_LAYER][SCRAPE_RESULT] url=${url} hasExtract=${Boolean(
+          extracted && (extracted.answer || extracted.details),
+        )}`,
+      );
+      if (extracted && (extracted.answer || extracted.details)) {
+        const answerText = (extracted.answer ?? "").toString();
+        const detailsText = (extracted.details ?? "").toString();
+        const combined = [answerText.trim(), detailsText.trim()]
+          .filter(Boolean)
+          .join("\n");
+        secondContextChunks.push(combined);
+
+        // Persist embedding for this second-layer page
+        try {
+          const embText = combined || url;
+          const vector = await getEmbedding(embText);
+          await SitemapModel.findOneAndUpdate(
+            { url },
+            { domain, url, title: "", embedding: vector },
+            { upsert: true },
+          );
+        } catch (err) {
+          console.warn(
+            `[QUERY][${requestId}][SECOND_LAYER][EMBED_FAIL] url=${url} error=${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[QUERY][${requestId}][SECOND_LAYER][SCRAPE_FAIL] url=${url} error=${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  const secondContext = secondContextChunks.join("\n---\n");
+  const combinedContext = [context, secondContext]
+    .filter(Boolean)
+    .join("\n---\n");
+
+  const secondAnswerStartedAt = Date.now();
+  const secondAnswer = await synthesizeAnswer(question, combinedContext);
+  console.log(
+    `[QUERY][${requestId}][SECOND_ANSWER] durationMs=${Date.now() - secondAnswerStartedAt}`,
+  );
+
+  const topSecondLevelLinks = secondLayerLinks.slice(0, 3);
+
+  const finalAnswer = secondAnswer;
+  const finalSolid = isSolidAnswer(finalAnswer, question, combinedContext);
+
+  if (!finalSolid) {
+    const fallback = buildUnconfirmedAnswer(
+      question,
+      firstLevelRelevantLinks,
+      topSecondLevelLinks,
+    );
+    const response: QueryResult = {
+      answer: fallback.answer,
+      sources,
+      relevantLinks: fallback.relevantLinks,
+      secondLevelLinks: fallback.secondLevelLinks,
+      isSolidAnswer: false,
+    };
+
+    setCachedValue(answerCache, answerCacheKey, response, ANSWER_CACHE_TTL_MS);
+    return response;
+  }
+
   const response: QueryResult = {
-    answer,
+    answer: finalAnswer,
     sources,
-    relevantLinks,
+    relevantLinks: firstLevelRelevantLinks,
+    secondLevelLinks: topSecondLevelLinks,
+    isSolidAnswer: finalSolid,
   };
 
   setCachedValue(answerCache, answerCacheKey, response, ANSWER_CACHE_TTL_MS);
@@ -624,7 +976,26 @@ export const handleQuery = async (req: Request, res: Response) => {
     return res.status(200).json(result);
   } catch (error: any) {
     if (error?.message === "No info found") {
-      return res.status(404).json({ message: "No info found" });
+      const payload = req.body as QueryPayload;
+      const normalizedCurrentUrl =
+        normalizeUrlInput(payload.currentPageUrl) ??
+        normalizeUrlInput(payload.websiteUrl);
+      const normalizedBaseUrl =
+        normalizeUrlInput(payload.baseUrl) ??
+        (normalizedCurrentUrl ? toBaseUrl(normalizedCurrentUrl) : null);
+      if (normalizedCurrentUrl && normalizedBaseUrl) {
+        return res
+          .status(200)
+          .json(
+            buildNoEvidenceFallback(
+              payload.question,
+              normalizedCurrentUrl,
+              normalizedBaseUrl,
+              [normalizedCurrentUrl, normalizedBaseUrl],
+            ),
+          );
+      }
+      return res.status(404).json({ message: "Invalid URL input" });
     }
 
     console.error(
