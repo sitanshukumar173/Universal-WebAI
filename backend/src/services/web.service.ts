@@ -234,7 +234,7 @@ export const mapNewWebsite = async (domain: string, websiteUrl: string) => {
       ignoreQueryParameters: true,
       includeSubdomains: false,
       limit: MAP_URL_LIMIT,
-      timeout: 60,
+      timeout: 120000,
     });
   };
 
