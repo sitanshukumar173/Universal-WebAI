@@ -29,19 +29,22 @@ const getEnvValue = (name: string) => {
 };
 
 const resolveKeyPool = (primaryName: string, fallbackNames: string[]) => {
+  // Prefer a single key like FIRECRAWL_KEY / GEMINI_KEY when present
+  const singular = getEnvValue(primaryName);
+  if (singular) return [singular];
+
+  // Next prefer any explicit fallback (e.g. GEMINI_API_KEY)
+  const explicitFallback = fallbackNames
+    .map((name) => getEnvValue(name))
+    .find(Boolean);
+  if (explicitFallback) return [explicitFallback];
+
+  // Finally, fall back to numbered keys FIRECRAWL_KEY_1, FIRECRAWL_KEY_2, ...
   const numbered = [1, 2]
     .map((index) => getEnvValue(`${primaryName}_${index}`))
     .filter(Boolean);
 
-  if (numbered.length > 0) {
-    return numbered;
-  }
-
-  const fallback = [primaryName, ...fallbackNames]
-    .map((name) => getEnvValue(name))
-    .find(Boolean);
-
-  return fallback ? [fallback] : [];
+  return numbered;
 };
 
 const resolveGeminiKeys = () =>
